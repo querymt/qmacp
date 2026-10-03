@@ -1,7 +1,7 @@
 # qmtacp
 
 CLI for a running QueryMT ACP WebSocket server (`qmtcode --acp-ws`).
-Default endpoint is `ws://127.0.0.1:3030/ws`.
+Default endpoint is `ws://127.0.0.1:3030/acp/ws`.
 
 Each invocation connects, initializes, does one job, and exits. Session ids
 are the only state. JSON goes to stdout; connection logs go to stderr.

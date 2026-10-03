@@ -3,7 +3,7 @@ use url::Url;
 
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 3030;
-pub const DEFAULT_PATH: &str = "/ws";
+pub const DEFAULT_PATH: &str = "/acp/ws";
 
 pub fn normalize_acp_ws_url(value: &str, allow_insecure: bool) -> Result<String> {
     let trimmed = value.trim();
@@ -122,16 +122,18 @@ mod tests {
     #[test]
     fn normalizes_websocket_urls_structurally() {
         let cases = [
-            ("127.0.0.1", "ws://127.0.0.1:3030/ws"),
-            ("localhost", "ws://localhost:3030/ws"),
-            ("::1", "ws://[::1]:3030/ws"),
-            ("ws://[::1]", "ws://[::1]:3030/ws"),
-            ("ws://host:80", "ws://host:80/ws"),
-            ("wss://host:443", "wss://host:443/ws"),
-            ("ws://[::1]:80", "ws://[::1]:80/ws"),
-            ("ws://host:9000", "ws://host:9000/ws"),
+            ("127.0.0.1", "ws://127.0.0.1:3030/acp/ws"),
+            ("localhost", "ws://localhost:3030/acp/ws"),
+            ("::1", "ws://[::1]:3030/acp/ws"),
+            ("ws://[::1]", "ws://[::1]:3030/acp/ws"),
+            ("ws://host:80", "ws://host:80/acp/ws"),
+            ("wss://host:443", "wss://host:443/acp/ws"),
+            ("ws://[::1]:80", "ws://[::1]:80/acp/ws"),
+            ("ws://host:9000", "ws://host:9000/acp/ws"),
             ("host/custom", "ws://host:3030/custom"),
-            ("host?token=test", "ws://host:3030/ws?token=test"),
+            ("host?token=test", "ws://host:3030/acp/ws?token=test"),
+            ("ws://127.0.0.1:3030/acp/ws", "ws://127.0.0.1:3030/acp/ws"),
+            ("ws://127.0.0.1:3030/ws", "ws://127.0.0.1:3030/ws"),
             (
                 "wss://host:9443/custom?token=test",
                 "wss://host:9443/custom?token=test",
@@ -154,24 +156,24 @@ mod tests {
         assert!(normalize_acp_ws_url("ws://remote.example", false).is_err());
         assert_eq!(
             normalize_acp_ws_url("wss://remote.example", false).unwrap(),
-            "wss://remote.example:3030/ws"
+            "wss://remote.example:3030/acp/ws"
         );
         assert_eq!(
             normalize_acp_ws_url("localhost", false).unwrap(),
-            "ws://localhost:3030/ws"
+            "ws://localhost:3030/acp/ws"
         );
         assert_eq!(
             normalize_acp_ws_url("::1", false).unwrap(),
-            "ws://[::1]:3030/ws"
+            "ws://[::1]:3030/acp/ws"
         );
     }
 
     #[test]
     fn endpoint_label_redacts_credentials_query_and_fragment() {
         assert_eq!(
-            safe_endpoint_label("wss://user:secret@example.com:443/ws?token=secret#fragment")
+            safe_endpoint_label("wss://user:secret@example.com:443/acp/ws?token=secret#fragment")
                 .unwrap(),
-            "wss://example.com:443/ws"
+            "wss://example.com:443/acp/ws"
         );
     }
 }
