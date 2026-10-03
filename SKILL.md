@@ -9,7 +9,7 @@ tags: ["querymt", "acp", "sessions", "automation", "orchestration", "qmtcode"]
 
 # qmtacp
 
-Each invocation connects, does one job, and exits. Default URL: `ws://127.0.0.1:3030/ws`.
+Each invocation connects, does one job, and exits. Default URL: `ws://127.0.0.1:3030/acp/ws`.
 The server owns session state. Keep the returned `sessionId`.
 
 - Do not invent session, profile, model, mode, effort, or URL values. Discover them (`caps`, `profiles`, `models`, `find`/`sessions`) or take them from JSON.
@@ -45,7 +45,7 @@ All of these come *before* the subcommand:
 qmtacp [--url URL] [--allow-insecure] [--pretty] [--permission allow-once|reject-once|cancel] [--quiet] [--version] [--help] <command>
 ```
 
-- `--url` / `-u`: `ws://`/`wss://` URL, or `host[:port][/path]`. Default `ws://127.0.0.1:3030/ws`.
+- `--url` / `-u`: `ws://`/`wss://` URL, or `host[:port][/path]`. Default `ws://127.0.0.1:3030/acp/ws`.
 - `--allow-insecure`: required for plaintext `ws://` to non-loopback hosts.
 - `--pretty`: pretty JSON. Do not use on NDJSON streams.
 - `--quiet`: hide connection logs on stderr.

@@ -25,7 +25,7 @@ const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("QMTACP_GIT_
 #[command(about = "JSON CLI for a running QueryMT ACP WebSocket server")]
 #[command(version = VERSION)]
 struct Cli {
-    /// ACP WebSocket URL or host[:port][/path]. Defaults to ws://127.0.0.1:3030/ws
+    /// ACP WebSocket URL or host[:port][/path]. Defaults to ws://127.0.0.1:3030/acp/ws
     #[arg(short, long, value_name = "url")]
     url: Option<String>,
 
