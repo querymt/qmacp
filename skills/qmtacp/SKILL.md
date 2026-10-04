@@ -1,10 +1,12 @@
 ---
-name: qmacp
+name: qmtacp
 description: "JSON CLI for a running QueryMT ACP WebSocket server (qmtcode --acp-ws). Find/create sessions, prompt, follow, steer, queue, configure, cancel, and inspect live protocol behavior. Use for operating live sessions and for testing/developing qmtcode."
-version: "0.1.0"
-compatibility: "*"
-allowed-tools: "shell"
-tags: ["querymt", "acp", "sessions", "automation", "orchestration", "qmtcode"]
+license: MIT
+compatibility: "Requires the qmacp binary on PATH and a running qmtcode --acp-ws. Uses the shell."
+allowed-tools: shell
+metadata:
+  version: "0.1.0"
+  tags: "querymt acp sessions automation orchestration qmtcode"
 ---
 
 # qmacp
@@ -19,21 +21,14 @@ The server owns session state. Keep the returned `sessionId`.
 
 ## Install
 
-Cargo:
+If `qmacp` is not on `PATH`, install it with the method that fits the current system. Do not treat a missing binary as a server failure.
+
+Prefer the Nix profile when `nix` is available, including on NixOS. Otherwise use Cargo.
 
 ```sh
-cargo install --path .
+nix profile install github:querymt/qmacp
 cargo install --git https://github.com/querymt/qmacp
 ```
-
-Nix profile:
-
-```sh
-nix profile install .
-nix profile install github:querymt/qmacp
-```
-
-If `qmacp` is not on `PATH`, install it. Do not treat a missing binary as a server failure.
 
 `--version` / `-V` and `--help` / `-h` do not connect.
 

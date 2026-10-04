@@ -8,16 +8,15 @@ are the only state. JSON goes to stdout; connection logs go to stderr.
 
 ## Install
 
-Cargo:
-
 ```sh
-cargo install --path .
+npx skills add querymt/qmacp
 cargo install --git https://github.com/querymt/qmacp
 ```
 
-Nix profile:
+From a checkout:
 
 ```sh
+cargo install --path .
 nix profile install .
 nix profile install github:querymt/qmacp
 ```
