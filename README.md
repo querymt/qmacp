@@ -1,4 +1,4 @@
-# qmtacp
+# qmacp
 
 CLI for a running QueryMT ACP WebSocket server (`qmtcode --acp-ws`).
 Default endpoint is `ws://127.0.0.1:3030/acp/ws`.
@@ -12,22 +12,22 @@ Cargo:
 
 ```sh
 cargo install --path .
-cargo install --git https://github.com/querymt/qmtacp
+cargo install --git https://github.com/querymt/qmacp
 ```
 
 Nix profile:
 
 ```sh
 nix profile install .
-nix profile install github:querymt/qmtacp
+nix profile install github:querymt/qmacp
 ```
 
 ```sh
-qmtacp --version
-qmtacp --help
+qmacp --version
+qmacp --help
 ```
 
-`--version` prints `qmtacp <crate-version> (<short-git-sha>)` and does not connect.
+`--version` prints `qmacp <crate-version> (<short-git-sha>)` and does not connect.
 
 ```sh
 cargo run -- caps

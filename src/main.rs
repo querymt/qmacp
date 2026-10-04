@@ -18,10 +18,10 @@ use crate::error::{CliError, ExitCode};
 use crate::policy::PermissionPolicy;
 use crate::url::{DEFAULT_HOST, normalize_acp_ws_url, safe_endpoint_label};
 
-const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("QMTACP_GIT_SHA"), ")");
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("QMACP_GIT_SHA"), ")");
 
 #[derive(Parser)]
-#[command(name = "qmtacp")]
+#[command(name = "qmacp")]
 #[command(about = "JSON CLI for a running QueryMT ACP WebSocket server")]
 #[command(version = VERSION)]
 struct Cli {

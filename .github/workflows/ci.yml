@@ -94,10 +94,10 @@ jobs:
         uses: swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: cargo build --release --bin qmtacp
+        run: cargo build --release --bin qmacp
 
       - name: Smoke CLI help
-        run: ./target/release/qmtacp --help
+        run: ./target/release/qmacp --help
 
   nix:
     name: Nix

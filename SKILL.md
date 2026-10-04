@@ -1,5 +1,5 @@
 ---
-name: qmtacp
+name: qmacp
 description: "JSON CLI for a running QueryMT ACP WebSocket server (qmtcode --acp-ws). Find/create sessions, prompt, follow, steer, queue, configure, cancel, and inspect live protocol behavior. Use for operating live sessions and for testing/developing qmtcode."
 version: "0.1.0"
 compatibility: "*"
@@ -7,14 +7,14 @@ allowed-tools: "shell"
 tags: ["querymt", "acp", "sessions", "automation", "orchestration", "qmtcode"]
 ---
 
-# qmtacp
+# qmacp
 
 Each invocation connects, does one job, and exits. Default URL: `ws://127.0.0.1:3030/acp/ws`.
 The server owns session state. Keep the returned `sessionId`.
 
 - Do not invent session, profile, model, mode, effort, or URL values. Discover them (`caps`, `profiles`, `models`, `find`/`sessions`) or take them from JSON.
 - Do not close a session unless the user asked to end it, or a qmtcode test explicitly requires `close`.
-- Do not use qmtacp to edit or test this repo; use ordinary tools. Use it against a running `qmtcode --acp-ws`.
+- Do not use qmacp to edit or test this repo; use ordinary tools. Use it against a running `qmtcode --acp-ws`.
 - If connection is refused, check that `qmtcode --acp-ws` is running. Do not retry blindly.
 
 ## Install
@@ -23,17 +23,17 @@ Cargo:
 
 ```sh
 cargo install --path .
-cargo install --git https://github.com/querymt/qmtacp
+cargo install --git https://github.com/querymt/qmacp
 ```
 
 Nix profile:
 
 ```sh
 nix profile install .
-nix profile install github:querymt/qmtacp
+nix profile install github:querymt/qmacp
 ```
 
-If `qmtacp` is not on `PATH`, install it. Do not treat a missing binary as a server failure.
+If `qmacp` is not on `PATH`, install it. Do not treat a missing binary as a server failure.
 
 `--version` / `-V` and `--help` / `-h` do not connect.
 
@@ -42,14 +42,14 @@ If `qmtacp` is not on `PATH`, install it. Do not treat a missing binary as a ser
 All of these come *before* the subcommand:
 
 ```sh
-qmtacp [--url URL] [--allow-insecure] [--pretty] [--permission allow-once|reject-once|cancel] [--quiet] [--version] [--help] <command>
+qmacp [--url URL] [--allow-insecure] [--pretty] [--permission allow-once|reject-once|cancel] [--quiet] [--version] [--help] <command>
 ```
 
 - `--url` / `-u`: `ws://`/`wss://` URL, or `host[:port][/path]`. Default `ws://127.0.0.1:3030/acp/ws`.
 - `--allow-insecure`: required for plaintext `ws://` to non-loopback hosts.
 - `--pretty`: pretty JSON. Do not use on NDJSON streams.
 - `--quiet`: hide connection logs on stderr.
-- `--version` / `-V`: print `qmtacp <crate-version> (<short-git-sha>)`.
+- `--version` / `-V`: print `qmacp <crate-version> (<short-git-sha>)`.
 - `--help` / `-h`: print CLI help.
 
 ## Output
@@ -67,13 +67,13 @@ The terminal prompt/follow event is `"type":"done"`; `text` is the assembled ass
 New work:
 
 ```sh
-qmtacp --quiet prompt --new --cwd "$PWD" --timeout 900 'do the task and report'
+qmacp --quiet prompt --new --cwd "$PWD" --timeout 900 'do the task and report'
 ```
 
 Continue:
 
 ```sh
-qmtacp --quiet prompt --cwd "$PWD" --timeout 900 "$SESSION_ID" 'next step'
+qmacp --quiet prompt --cwd "$PWD" --timeout 900 "$SESSION_ID" 'next step'
 ```
 
 Long prompts: stdin (`-`), not nested quoting. Make prompts self-contained; elicitation is always cancelled.
@@ -95,11 +95,11 @@ Do not `steer`, `queue`, `discard-queued`, or `cancel` just because a timeout fi
 Discover:
 
 ```sh
-qmtacp --quiet caps
-qmtacp --quiet profiles
-qmtacp --quiet models
-qmtacp --quiet models --query '<term>' --provider '<provider>'
-qmtacp --quiet models --refresh
+qmacp --quiet caps
+qmacp --quiet profiles
+qmacp --quiet models
+qmacp --quiet models --query '<term>' --provider '<provider>'
+qmacp --quiet models --refresh
 ```
 
 `caps.querymt == null` means ACP initialize succeeded but QueryMT extension discovery did not.
@@ -107,10 +107,10 @@ qmtacp --quiet models --refresh
 Sessions:
 
 ```sh
-qmtacp --quiet new --cwd "$PWD" --profile '<profile>' --mode build --model '<model-id>' --effort high
-qmtacp --quiet sessions --cwd "$PWD" --limit 20
-qmtacp --quiet sessions --cwd "$PWD" --all
-qmtacp --quiet find --cwd "$PWD" --query '<title-or-id-fragment>' --phase idle --limit 50
+qmacp --quiet new --cwd "$PWD" --profile '<profile>' --mode build --model '<model-id>' --effort high
+qmacp --quiet sessions --cwd "$PWD" --limit 20
+qmacp --quiet sessions --cwd "$PWD" --all
+qmacp --quiet find --cwd "$PWD" --query '<title-or-id-fragment>' --phase idle --limit 50
 ```
 
 `new` creates only. Prefer `prompt --new` when the next step is a prompt.
@@ -119,13 +119,13 @@ If `find` returns multiple matches, do not pick by list order; inspect or ask.
 Inspect / configure:
 
 ```sh
-qmtacp --quiet status --cwd "$PWD" "$SESSION_ID"
-qmtacp --quiet runtime "$SESSION_ID"
-qmtacp --quiet inspect --cwd "$PWD" --messages 20 --tools false "$SESSION_ID"
-qmtacp --quiet inspect --cwd "$PWD" --full "$SESSION_ID"
-qmtacp --quiet set-mode "$SESSION_ID" plan      # build|plan|review
-qmtacp --quiet set-model "$SESSION_ID" '<model-id>'
-qmtacp --quiet set-effort "$SESSION_ID" high    # auto|low|medium|high|max
+qmacp --quiet status --cwd "$PWD" "$SESSION_ID"
+qmacp --quiet runtime "$SESSION_ID"
+qmacp --quiet inspect --cwd "$PWD" --messages 20 --tools false "$SESSION_ID"
+qmacp --quiet inspect --cwd "$PWD" --full "$SESSION_ID"
+qmacp --quiet set-mode "$SESSION_ID" plan      # build|plan|review
+qmacp --quiet set-model "$SESSION_ID" '<model-id>'
+qmacp --quiet set-effort "$SESSION_ID" high    # auto|low|medium|high|max
 ```
 
 `status` is mode/model/profile/effort. `runtime` is phase/queue/steerability.
@@ -134,10 +134,10 @@ qmtacp --quiet set-effort "$SESSION_ID" high    # auto|low|medium|high|max
 Prompt:
 
 ```sh
-qmtacp --quiet prompt --new --cwd "$PWD" --profile '<profile>' --mode build --model '<id>' --effort high --timeout 900 'text'
-qmtacp --quiet prompt --cwd "$PWD" --delivery auto --timeout 900 "$SESSION_ID" 'text'
-qmtacp --quiet prompt --cwd "$PWD" --delivery prompt|steer|queue --until-idle false "$SESSION_ID" 'text'
-qmtacp --quiet --permission allow-once prompt --new --cwd "$PWD" --timeout 900 - < instructions.txt
+qmacp --quiet prompt --new --cwd "$PWD" --profile '<profile>' --mode build --model '<id>' --effort high --timeout 900 'text'
+qmacp --quiet prompt --cwd "$PWD" --delivery auto --timeout 900 "$SESSION_ID" 'text'
+qmacp --quiet prompt --cwd "$PWD" --delivery prompt|steer|queue --until-idle false "$SESSION_ID" 'text'
+qmacp --quiet --permission allow-once prompt --new --cwd "$PWD" --timeout 900 - < instructions.txt
 ```
 
 `--until-idle` defaults true and waits through queued turns. Default timeout if omitted is 120s.
@@ -145,24 +145,24 @@ qmtacp --quiet --permission allow-once prompt --new --cwd "$PWD" --timeout 900 -
 Live control:
 
 ```sh
-qmtacp --quiet follow "$SESSION_ID" --timeout 900 --interval 1
-qmtacp --quiet watch "$SESSION_ID" --timeout 900 --interval 1 --idle true
-qmtacp --quiet steer "$SESSION_ID" --run-id "$RUN_ID" 'adjust the active work'
-qmtacp --quiet queue "$SESSION_ID" 'do this after the current turn'
-qmtacp --quiet discard-queued "$SESSION_ID" "$INPUT_ID"
-qmtacp --quiet cancel "$SESSION_ID"
-qmtacp --quiet close "$SESSION_ID"
+qmacp --quiet follow "$SESSION_ID" --timeout 900 --interval 1
+qmacp --quiet watch "$SESSION_ID" --timeout 900 --interval 1 --idle true
+qmacp --quiet steer "$SESSION_ID" --run-id "$RUN_ID" 'adjust the active work'
+qmacp --quiet queue "$SESSION_ID" 'do this after the current turn'
+qmacp --quiet discard-queued "$SESSION_ID" "$INPUT_ID"
+qmacp --quiet cancel "$SESSION_ID"
+qmacp --quiet close "$SESSION_ID"
 ```
 
 `follow` streams session events until idle and loads cwd from the current process; run it from the session workspace.
 `watch` polls `runtime` (`"type":"runtime"`) until idle unless `--idle false`. Default `follow`/`watch` timeout is 120s.
-`steer --run-id` is optional; if omitted, qmtacp uses `runtime.active_run_id`.
+`steer --run-id` is optional; if omitted, qmacp uses `runtime.active_run_id`.
 Queued submit returns `clientInputId`. `input_state` events expose `inputId`; pass that exact value to `discard-queued`.
 
 Batch:
 
 ```sh
-qmtacp --quiet exec <<EOF
+qmacp --quiet exec <<EOF
 status --cwd "$PWD" "$SESSION_ID"
 runtime "$SESSION_ID"
 inspect --cwd "$PWD" --messages 20 --tools false "$SESSION_ID"
@@ -173,7 +173,7 @@ EOF
 
 ## Testing and developing qmtcode
 
-qmtacp is a protocol client for `qmtcode --acp-ws`. Use it as a harness while changing qmtcode: start the server, hit it with qmtacp, and treat stdout JSON/NDJSON as the assertion surface.
+qmacp is a protocol client for `qmtcode --acp-ws`. Use it as a harness while changing qmtcode: start the server, hit it with qmacp, and treat stdout JSON/NDJSON as the assertion surface.
 
 Typical checks:
 
@@ -183,9 +183,9 @@ Typical checks:
 - Busy-session behavior: prompt a running session with `--delivery auto|steer|queue`; confirm `input_state` and `clientInputId`.
 - Config RPCs: `set-mode` / `set-model` / `set-effort`, then `status` to verify the server accepted the change.
 - Permission path: `--permission allow-once|reject-once|cancel` and inspect `permission` events. Do not assume fail-closed unless `cancel`.
-- Elicitation: qmtacp always cancels; expect `"type":"elicitation"` with `cancelled: true`.
+- Elicitation: qmacp always cancels; expect `"type":"elicitation"` with `cancelled: true`.
 - Load/list features: if `caps.acp.loadSession`/`list`/`close` are false, do not keep calling `inspect`/`sessions`/`close`.
 
 Do not treat a previous command’s output as current runtime state; query `runtime` or `status` again.
 Do not claim a cancel/discard/close/config change succeeded unless the command exited 0 and JSON `ok` is true.
-For qmtcode work, pass `--cwd` to the qmtcode checkout (or the fixture workspace), not to this qmtacp repo unless that is the session under test.
+For qmtcode work, pass `--cwd` to the qmtcode checkout (or the fixture workspace), not to this qmacp repo unless that is the session under test.
