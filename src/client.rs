@@ -121,10 +121,7 @@ impl AcpClient {
             .request(
                 acp::InitializeRequest::new(ProtocolVersion::V1)
                     .client_capabilities(client_capabilities())
-                    .client_info(acp::Implementation::new(
-                        "qmacp",
-                        env!("CARGO_PKG_VERSION"),
-                    )),
+                    .client_info(acp::Implementation::new("qmacp", env!("CARGO_PKG_VERSION"))),
             )
             .await?;
         *self.initialized.lock().await = Some(response.clone());
