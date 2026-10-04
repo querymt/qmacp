@@ -10,6 +10,7 @@ are the only state. JSON goes to stdout; connection logs go to stderr.
 
 ```sh
 npx skills add querymt/qmacp
+bunx skills add querymt/qmacp
 cargo install --git https://github.com/querymt/qmacp
 ```
 
