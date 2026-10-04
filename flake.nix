@@ -21,33 +21,33 @@
 
         cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
 
-        qmtacp = pkgs.rustPlatform.buildRustPackage {
-          pname = "qmtacp";
+        qmacp = pkgs.rustPlatform.buildRustPackage {
+          pname = "qmacp";
           version = cargoToml.package.version;
           src = ./.;
           cargoLock = {
             lockFile = ./Cargo.lock;
           };
           env = {
-            QMTACP_GIT_SHA = self.shortRev or self.dirtyShortRev or "unknown";
+            QMACP_GIT_SHA = self.shortRev or self.dirtyShortRev or "unknown";
           };
           auditable = false;
           doCheck = false;
         };
       in {
         packages = {
-          qmtacp = qmtacp;
-          default = qmtacp;
+          qmacp = qmacp;
+          default = qmacp;
         };
 
         apps = {
-          qmtacp = {
+          qmacp = {
             type = "app";
-            program = "${self.packages.${system}.qmtacp}/bin/qmtacp";
+            program = "${self.packages.${system}.qmacp}/bin/qmacp";
           };
           default = {
             type = "app";
-            program = "${self.packages.${system}.qmtacp}/bin/qmtacp";
+            program = "${self.packages.${system}.qmacp}/bin/qmacp";
           };
         };
 
@@ -59,7 +59,7 @@
           ];
 
           shellHook = ''
-            export PS1="(dev:qmtacp) $PS1"
+            export PS1="(dev:qmacp) $PS1"
           '';
         };
       };

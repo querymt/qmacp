@@ -1,18 +1,18 @@
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=QMTACP_GIT_SHA");
+    println!("cargo:rerun-if-env-changed=QMACP_GIT_SHA");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs/heads");
 
-    let sha = std::env::var("QMTACP_GIT_SHA")
+    let sha = std::env::var("QMACP_GIT_SHA")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .or_else(git_short_sha)
         .unwrap_or_else(|| "unknown".to_string());
 
-    println!("cargo:rustc-env=QMTACP_GIT_SHA={sha}");
+    println!("cargo:rustc-env=QMACP_GIT_SHA={sha}");
 }
 
 fn git_short_sha() -> Option<String> {

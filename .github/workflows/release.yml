@@ -56,14 +56,14 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --release --bin qmtacp --target ${{ matrix.target }}
+        run: cargo build --release --bin qmacp --target ${{ matrix.target }}
 
       - name: Package archive
         run: |
-          PKG="qmtacp-${{ github.ref_name }}-${{ matrix.target }}"
+          PKG="qmacp-${{ github.ref_name }}-${{ matrix.target }}"
           STAGING="dist/${PKG}"
           mkdir -p "$STAGING"
-          cp "target/${{ matrix.target }}/release/qmtacp" "$STAGING/"
+          cp "target/${{ matrix.target }}/release/qmacp" "$STAGING/"
           cp README.md LICENSE "$STAGING/"
           tar -czf "dist/${PKG}.tar.gz" -C dist "$PKG"
           echo "ASSET_PATH=dist/${PKG}.tar.gz" >> "$GITHUB_ENV"
@@ -71,7 +71,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: qmtacp-${{ matrix.target }}
+          name: qmacp-${{ matrix.target }}
           path: ${{ env.ASSET_PATH }}
 
   release:
@@ -84,7 +84,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts/
-          pattern: 'qmtacp-*'
+          pattern: 'qmacp-*'
           merge-multiple: true
 
       - name: Create GitHub Release

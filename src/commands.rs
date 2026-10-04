@@ -974,7 +974,7 @@ async fn exec(
 }
 
 #[derive(Parser)]
-#[command(name = "qmtacp")]
+#[command(name = "qmacp")]
 struct ExecLine {
     #[command(subcommand)]
     command: Command,
@@ -982,7 +982,7 @@ struct ExecLine {
 
 fn parse_exec_line(line: &str) -> Result<Command, CliError> {
     let args = split_exec_args(line);
-    let mut argv = vec!["qmtacp".to_string()];
+    let mut argv = vec!["qmacp".to_string()];
     argv.extend(args);
     ExecLine::try_parse_from(&argv)
         .map(|cli| cli.command)

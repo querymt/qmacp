@@ -1,15 +1,15 @@
 [package]
-name = "qmtacp"
+name = "qmacp"
 description = "CLI for controlling a running QueryMT ACP WebSocket server."
 authors = ["Ivan Zatevakhin <ivan@query.mt>"]
-repository = "https://github.com/querymt/qmtacp"
+repository = "https://github.com/querymt/qmacp"
 homepage = "https://query.mt"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
 [[bin]]
-name = "qmtacp"
+name = "qmacp"
 path = "src/main.rs"
 
 [dependencies]

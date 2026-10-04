@@ -121,10 +121,7 @@ impl AcpClient {
             .request(
                 acp::InitializeRequest::new(ProtocolVersion::V1)
                     .client_capabilities(client_capabilities())
-                    .client_info(acp::Implementation::new(
-                        "qmtacp",
-                        env!("CARGO_PKG_VERSION"),
-                    )),
+                    .client_info(acp::Implementation::new("qmacp", env!("CARGO_PKG_VERSION"))),
             )
             .await?;
         *self.initialized.lock().await = Some(response.clone());
@@ -411,7 +408,7 @@ fn inbound_request_reply(
         json!({
             "jsonrpc": "2.0",
             "id": id,
-            "error": { "code": -32601, "message": format!("qmtacp does not support {method}") },
+            "error": { "code": -32601, "message": format!("qmacp does not support {method}") },
         }),
         None,
     ))
