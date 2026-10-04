@@ -1,59 +1,74 @@
 # qmacp
 
-CLI for a running QueryMT ACP WebSocket server (`qmtcode --acp-ws`).
-Default endpoint is `ws://127.0.0.1:3030/acp/ws`.
+JSON CLI for a running QueryMT ACP WebSocket server (`qmtcode --acp-ws`).
 
-Each invocation connects, initializes, does one job, and exits. Session ids
-are the only state. JSON goes to stdout; connection logs go to stderr.
+Each invocation connects, does one job, and exits. The server owns session state. Keep the returned `sessionId`. JSON goes to stdout. Connection logs go to stderr.
+
+Default endpoint: `ws://127.0.0.1:3030/acp/ws`.
 
 ## Install
 
-Cargo:
+Skill, for agents:
 
 ```sh
-cargo install --path .
+npx skills add querymt/qmacp
+bunx skills add querymt/qmacp
+```
+
+Binary. Prefer Nix when `nix` is available. Otherwise use Cargo.
+
+```sh
+nix profile install github:querymt/qmacp
 cargo install --git https://github.com/querymt/qmacp
 ```
 
-Nix profile:
+From a checkout:
 
 ```sh
+cargo install --path .
 nix profile install .
-nix profile install github:querymt/qmacp
 ```
+
+`--version` and `--help` do not connect. `--version` prints `qmacp <crate-version> (<short-git-sha>)`.
+
+## Use
 
 ```sh
-qmacp --version
-qmacp --help
+qmacp --quiet caps
+qmacp --quiet prompt --new --cwd . --timeout 900 'fix the build'
+qmacp --quiet prompt --cwd . --timeout 900 "$SESSION_ID" 'run the tests'
+qmacp --quiet runtime "$SESSION_ID"
+qmacp --quiet follow "$SESSION_ID"
 ```
 
-`--version` prints `qmacp <crate-version> (<short-git-sha>)` and does not connect.
+Globals come before the subcommand: `--url`, `--allow-insecure`, `--pretty`, `--permission`, `--quiet`.
 
-```sh
-cargo run -- caps
-cargo run -- new --cwd . --profile default --mode build
-cargo run -- sessions --cwd . --limit 20
-cargo run -- models --query grok --provider xai
-cargo run -- --quiet prompt --new --cwd . "fix the build"
-cargo run -- --quiet prompt SESSION_ID "continue"
-cargo run -- runtime SESSION_ID
-cargo run -- follow SESSION_ID
-cargo run -- steer SESSION_ID --run-id RUN "stop and summarize"
-cargo run -- queue SESSION_ID "next: run tests"
-cargo run -- discard-queued SESSION_ID INPUT_ID
-cargo run -- inspect SESSION_ID --messages 20
-cargo run -- set-mode SESSION_ID plan
-cargo run -- cancel SESSION_ID
-```
+`--permission` defaults to `allow-once`. `reject-once` rejects one tool call. `cancel` selects nothing.
 
-`prompt` streams compact NDJSON (`text`, `tool`, `mode`, `plan`, `input_state`,
-`done`) and waits until the session is idle, including queued turns. `done`
-includes assembled assistant `text`. For an existing busy session,
-`--delivery auto` (default) steers if possible, otherwise queues. The
-`INPUT_ID` passed to `discard-queued` is the `inputId` from an `input_state`
-event, which matches the `clientInputId` returned when the input is submitted.
-`follow SESSION` streams updates until idle. `exec` runs multiple commands on
-one connection. `--quiet` hides connection logs.
+## Commands
 
-`--permission allow-once` is the default so coder tools can run. Elicitation
-requests are cancelled and emitted as NDJSON events during `prompt`.
+Discover: `caps`, `profiles`, `models`
+
+Sessions: `new`, `sessions`, `find`, `inspect`, `status`, `close`
+
+Configure: `set-mode` (`build|plan|review`), `set-model`, `set-effort` (`auto|low|medium|high|max`)
+
+Work: `prompt`, `follow`, `watch`, `steer`, `queue`, `discard-queued`, `exec`, `cancel`, `runtime`
+
+`prompt --new TEXT` creates a session. `prompt SESSION_ID TEXT` continues one. `-` reads the prompt from stdin. `--delivery auto` prompts when idle, steers when the turn is steerable, otherwise queues. It waits until idle, including queued turns.
+
+`discard-queued` takes the `inputId` from an `input_state` event. That is the same value as `clientInputId` from the submit response.
+
+`exec` runs several commands on one connection. It is not a shell.
+
+## Output
+
+Most commands print one JSON object. `prompt`, `follow`, and `exec` stream compact NDJSON. `watch` also emits `runtime` events.
+
+Success is exit 0 and `ok` not false. Streamed commands also need a `"type":"done"` event. `done.text` is the assembled assistant response.
+
+Exit codes: 0 ok, 1 usage, 2 connection, 3 RPC, 4 timeout or cancel.
+
+Event types: `session`, `text`, `tool`, `mode`, `plan`, `input_state`, `permission`, `elicitation`, `runtime`, `update`, `done`.
+
+Elicitation is cancelled and emitted as an event.
