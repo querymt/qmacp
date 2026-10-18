@@ -44,7 +44,7 @@ pub fn compact_session_summary(session: &acp::SessionInfo) -> Value {
         .and_then(|meta| serde_json::to_value(meta).ok())
         .unwrap_or(Value::Null);
     let runtime = meta.get("runtimeStatus").cloned().unwrap_or(Value::Null);
-    json!({
+    let mut summary = json!({
         "sessionId": session.session_id.to_string(),
         "cwd": path_string(&session.cwd),
         "title": session.title,
@@ -52,7 +52,14 @@ pub fn compact_session_summary(session: &acp::SessionInfo) -> Value {
         "phase": runtime.get("phase").cloned(),
         "messageCount": meta.get("messageCount").cloned(),
         "runtime": runtime,
-    })
+    });
+    if let Some(lifecycle) = meta
+        .get("querymt")
+        .and_then(|querymt| querymt.get("lifecycle"))
+    {
+        summary["_meta"] = json!({ "querymt": { "lifecycle": lifecycle } });
+    }
+    summary
 }
 
 pub fn config_status(
@@ -506,5 +513,29 @@ mod tests {
         let values = config_values_from_raw(&raw);
         assert_eq!(values["profile"], "default");
         assert_eq!(values["model"], "xai/grok-4.5");
+    }
+
+    #[test]
+    fn session_summary_preserves_known_lifecycle_metadata_without_fabricating_state() {
+        let lifecycle = json!({
+            "resolved": true,
+            "archived": false,
+            "resolved_at": "2025-01-02T03:04:05Z",
+            "archived_at": null
+        });
+        let meta = serde_json::from_value::<Map<String, Value>>(json!({
+            "querymt": { "lifecycle": lifecycle }
+        }))
+        .unwrap();
+        let session = acp::SessionInfo::new("session-1", "/tmp").meta(meta);
+        let summary = compact_session_summary(&session);
+        assert_eq!(summary["_meta"]["querymt"]["lifecycle"]["resolved"], true);
+        assert_eq!(
+            summary["_meta"]["querymt"]["lifecycle"]["resolved_at"],
+            "2025-01-02T03:04:05Z"
+        );
+
+        let legacy = acp::SessionInfo::new("session-2", "/tmp");
+        assert!(compact_session_summary(&legacy).get("_meta").is_none());
     }
 }

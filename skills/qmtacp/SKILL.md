@@ -105,7 +105,9 @@ Sessions:
 qmacp --quiet new --cwd "$PWD" --profile '<profile>' --mode build --model '<model-id>' --effort high
 qmacp --quiet sessions --cwd "$PWD" --limit 20
 qmacp --quiet sessions --cwd "$PWD" --all
+qmacp --quiet sessions --cwd "$PWD" --resolution open --archive excluded
 qmacp --quiet find --cwd "$PWD" --query '<title-or-id-fragment>' --phase idle --limit 50
+qmacp --quiet find --cwd "$PWD" --resolution resolved --archive only
 ```
 
 `new` creates only. Prefer `prompt --new` when the next step is a prompt.
@@ -121,7 +123,12 @@ qmacp --quiet inspect --cwd "$PWD" --full "$SESSION_ID"
 qmacp --quiet set-mode "$SESSION_ID" plan      # build|plan|review
 qmacp --quiet set-model "$SESSION_ID" '<model-id>'
 qmacp --quiet set-effort "$SESSION_ID" high    # auto|low|medium|high|max
+qmacp --quiet get-lifecycle "$SESSION_ID"
+qmacp --quiet set-lifecycle "$SESSION_ID" --resolved true
+qmacp --quiet set-lifecycle "$SESSION_ID" --resolved false --archived true
 ```
+
+`set-lifecycle` uses explicit desired values (not toggles); at least one of `--resolved` or `--archived` is required, and omitted fields stay unchanged. `sessions` and `find` accept `--resolution any|open|resolved` and `--archive any|excluded|only`; omitted dimensions mean `any`, and omitting both options preserves legacy requests. Filters are sent to the server for every page. `caps` reports `features.session_lifecycle` and supported methods; unsupported lifecycle operations/filters fail rather than returning invented state. Session summaries include available `_meta.querymt.lifecycle` data and omit it when unavailable.
 
 `status` is mode/model/profile/effort. `runtime` is phase/queue/steerability.
 `inspect --tools` defaults true; pass `--tools false` for compact history. `--full` dumps the raw snapshot (large).
@@ -160,6 +167,9 @@ Batch:
 qmacp --quiet exec <<EOF
 status --cwd "$PWD" "$SESSION_ID"
 runtime "$SESSION_ID"
+get-lifecycle "$SESSION_ID"
+set-lifecycle "$SESSION_ID" --resolved false
+sessions --resolution open --archive excluded
 inspect --cwd "$PWD" --messages 20 --tools false "$SESSION_ID"
 EOF
 ```

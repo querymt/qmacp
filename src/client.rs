@@ -9,7 +9,7 @@ use agent_client_protocol::{
 };
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -153,15 +153,10 @@ impl AcpClient {
         &self,
         cwd: Option<std::path::PathBuf>,
         cursor: Option<String>,
+        lifecycle_filters: Option<Map<String, Value>>,
     ) -> Result<acp::ListSessionsResponse> {
-        let mut request = acp::ListSessionsRequest::new();
-        if let Some(cwd) = cwd {
-            request = request.cwd(cwd);
-        }
-        if let Some(cursor) = cursor {
-            request = request.cursor(cursor);
-        }
-        self.request(request).await
+        self.request(build_list_sessions_request(cwd, cursor, lifecycle_filters))
+            .await
     }
 
     pub async fn load_session(
@@ -315,6 +310,24 @@ impl AcpClient {
     }
 }
 
+fn build_list_sessions_request(
+    cwd: Option<std::path::PathBuf>,
+    cursor: Option<String>,
+    lifecycle_filters: Option<Map<String, Value>>,
+) -> acp::ListSessionsRequest {
+    let mut request = acp::ListSessionsRequest::new();
+    if let Some(cwd) = cwd {
+        request = request.cwd(cwd);
+    }
+    if let Some(cursor) = cursor {
+        request = request.cursor(cursor);
+    }
+    if let Some(meta) = lifecycle_filters {
+        request = request.meta(meta);
+    }
+    request
+}
+
 async fn fail_pending(pending: &PendingRequests, message: impl Into<String>) {
     let message = message.into();
     for (_, waiter) in pending.lock().await.drain() {
@@ -423,6 +436,40 @@ fn client_capabilities() -> acp::ClientCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_sessions_request_repeats_filters_on_each_cursor_and_omits_empty_metadata() {
+        let filters = serde_json::from_value::<Map<String, Value>>(json!({
+            "querymt": {
+                "sessionFilters": {
+                    "resolution": "open",
+                    "archive": "excluded"
+                }
+            }
+        }))
+        .unwrap();
+
+        for cursor in [None, Some("next-page".to_string())] {
+            let request = build_list_sessions_request(None, cursor.clone(), Some(filters.clone()));
+            let params = request.to_untyped_message().unwrap().params;
+            assert_eq!(
+                params["_meta"]["querymt"]["sessionFilters"]["resolution"],
+                "open"
+            );
+            assert_eq!(
+                params["_meta"]["querymt"]["sessionFilters"]["archive"],
+                "excluded"
+            );
+            assert_eq!(
+                params.get("cursor").and_then(Value::as_str),
+                cursor.as_deref()
+            );
+        }
+
+        let request = build_list_sessions_request(None, None, None);
+        let params = request.to_untyped_message().unwrap().params;
+        assert!(params.get("_meta").is_none());
+    }
 
     #[test]
     fn permission_reply_uses_allow_once_by_default() {
