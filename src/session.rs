@@ -57,7 +57,9 @@ pub fn compact_session_summary(session: &acp::SessionInfo) -> Value {
     let lifecycle = querymt
         .and_then(|querymt| querymt.get("lifecycle"))
         .filter(|lifecycle| !lifecycle.is_null());
-    let pin = querymt.and_then(|querymt| querymt.get("pin"));
+    let pin = querymt
+        .and_then(|querymt| querymt.get("pin"))
+        .filter(|pin| !pin.is_null());
     if lifecycle.is_some() || pin.is_some() {
         let mut known_metadata = Map::new();
         if let Some(lifecycle) = lifecycle {
@@ -598,5 +600,22 @@ mod tests {
         assert_eq!(summary["_meta"]["querymt"]["pin"]["pinned"], true);
         assert!(summary["_meta"]["querymt"].get("lifecycle").is_none());
         assert_eq!(summary["messageCount"], 8);
+
+        let null_pin_meta = serde_json::from_value::<Map<String, Value>>(json!({
+            "querymt": { "pin": null }
+        }))
+        .unwrap();
+        let null_pin = acp::SessionInfo::new("session-5", "/tmp").meta(null_pin_meta);
+        assert!(compact_session_summary(&null_pin).get("_meta").is_none());
+
+        let lifecycle_with_null_pin_meta = serde_json::from_value::<Map<String, Value>>(json!({
+            "querymt": { "lifecycle": lifecycle.clone(), "pin": null }
+        }))
+        .unwrap();
+        let lifecycle_with_null_pin =
+            acp::SessionInfo::new("session-6", "/tmp").meta(lifecycle_with_null_pin_meta);
+        let summary = compact_session_summary(&lifecycle_with_null_pin);
+        assert_eq!(summary["_meta"]["querymt"]["lifecycle"], lifecycle);
+        assert!(summary["_meta"]["querymt"].get("pin").is_none());
     }
 }
