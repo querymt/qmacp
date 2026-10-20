@@ -56,6 +56,7 @@ pub fn compact_session_summary(session: &acp::SessionInfo) -> Value {
     if let Some(lifecycle) = meta
         .get("querymt")
         .and_then(|querymt| querymt.get("lifecycle"))
+        .filter(|lifecycle| !lifecycle.is_null())
     {
         summary["_meta"] = json!({ "querymt": { "lifecycle": lifecycle } });
     }
@@ -537,5 +538,18 @@ mod tests {
 
         let legacy = acp::SessionInfo::new("session-2", "/tmp");
         assert!(compact_session_summary(&legacy).get("_meta").is_none());
+
+        let meta = serde_json::from_value::<Map<String, Value>>(json!({
+            "querymt": { "lifecycle": null },
+            "messageCount": 7,
+            "runtimeStatus": { "phase": "idle" }
+        }))
+        .unwrap();
+        let session = acp::SessionInfo::new("session-3", "/tmp").meta(meta);
+        let summary = compact_session_summary(&session);
+        assert!(summary.get("_meta").is_none());
+        assert_eq!(summary["messageCount"], 7);
+        assert_eq!(summary["runtime"]["phase"], "idle");
+        assert_eq!(summary["title"], json!(session.title));
     }
 }
