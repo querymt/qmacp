@@ -126,9 +126,13 @@ qmacp --quiet set-effort "$SESSION_ID" high    # auto|low|medium|high|max
 qmacp --quiet get-lifecycle "$SESSION_ID"
 qmacp --quiet set-lifecycle "$SESSION_ID" --resolved true
 qmacp --quiet set-lifecycle "$SESSION_ID" --resolved false --archived true
+qmacp --quiet pin "$SESSION_ID"
+qmacp --quiet unpin "$SESSION_ID"
+qmacp --quiet sessions --pinned
+qmacp --quiet find --query 'build' --pinned=false
 ```
 
-`set-lifecycle` uses explicit desired values (not toggles); at least one of `--resolved` or `--archived` is required, and omitted fields stay unchanged. `sessions` and `find` accept `--resolution any|open|resolved` and `--archive any|excluded|only`; omitted dimensions mean `any`, and omitting both options preserves legacy requests. Filters are sent to the server for every page. `caps` reports `features.session_lifecycle` and supported methods; unsupported lifecycle operations/filters fail rather than returning invented state. Session summaries include available `_meta.querymt.lifecycle` data and omit it when unavailable.
+`set-lifecycle` uses explicit desired values (not toggles); at least one of `--resolved` or `--archived` is required, and omitted fields stay unchanged. `sessions` and `find` accept `--resolution any|open|resolved`, `--archive any|excluded|only`, and `--pinned` (equivalent to `--pinned=true`) or `--pinned=false`; omitted dimensions preserve legacy requests. Filters are sent to the server for every page. `caps` reports `features.session_lifecycle`, `features.session_pins`, and supported methods; unsupported lifecycle or pin operations/filters fail rather than returning invented state. Session summaries include available `_meta.querymt.lifecycle` and `_meta.querymt.pin` data and omit each when unavailable.
 
 `status` is mode/model/profile/effort. `runtime` is phase/queue/steerability.
 `inspect --tools` defaults true; pass `--tools false` for compact history. `--full` dumps the raw snapshot (large).

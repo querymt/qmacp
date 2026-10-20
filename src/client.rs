@@ -153,9 +153,9 @@ impl AcpClient {
         &self,
         cwd: Option<std::path::PathBuf>,
         cursor: Option<String>,
-        lifecycle_filters: Option<Map<String, Value>>,
+        session_filters: Option<Map<String, Value>>,
     ) -> Result<acp::ListSessionsResponse> {
-        self.request(build_list_sessions_request(cwd, cursor, lifecycle_filters))
+        self.request(build_list_sessions_request(cwd, cursor, session_filters))
             .await
     }
 
@@ -313,7 +313,7 @@ impl AcpClient {
 fn build_list_sessions_request(
     cwd: Option<std::path::PathBuf>,
     cursor: Option<String>,
-    lifecycle_filters: Option<Map<String, Value>>,
+    session_filters: Option<Map<String, Value>>,
 ) -> acp::ListSessionsRequest {
     let mut request = acp::ListSessionsRequest::new();
     if let Some(cwd) = cwd {
@@ -322,7 +322,7 @@ fn build_list_sessions_request(
     if let Some(cursor) = cursor {
         request = request.cursor(cursor);
     }
-    if let Some(meta) = lifecycle_filters {
+    if let Some(meta) = session_filters {
         request = request.meta(meta);
     }
     request
@@ -443,7 +443,8 @@ mod tests {
             "querymt": {
                 "sessionFilters": {
                     "resolution": "open",
-                    "archive": "excluded"
+                    "archive": "excluded",
+                    "pinned": false
                 }
             }
         }))
@@ -459,6 +460,10 @@ mod tests {
             assert_eq!(
                 params["_meta"]["querymt"]["sessionFilters"]["archive"],
                 "excluded"
+            );
+            assert_eq!(
+                params["_meta"]["querymt"]["sessionFilters"]["pinned"],
+                false
             );
             assert_eq!(
                 params.get("cursor").and_then(Value::as_str),
