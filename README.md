@@ -51,6 +51,8 @@ Discover: `caps`, `profiles`, `models`
 
 Sessions: `new`, `sessions`, `find`, `inspect`, `status`, `close`
 
+Lifecycle: `get-lifecycle`, `set-lifecycle`; `--resolution any|open|resolved` and `--archive any|excluded|only` filter `sessions` and `find` on the server before pagination. Omitting both filters preserves the existing listing behavior.
+
 Configure: `set-mode` (`build|plan|review`), `set-model`, `set-effort` (`auto|low|medium|high|max`)
 
 Work: `prompt`, `follow`, `watch`, `steer`, `queue`, `discard-queued`, `exec`, `cancel`, `runtime`
@@ -59,7 +61,25 @@ Work: `prompt`, `follow`, `watch`, `steer`, `queue`, `discard-queued`, `exec`, `
 
 `discard-queued` takes the `inputId` from an `input_state` event. That is the same value as `clientInputId` from the submit response.
 
-`exec` runs several commands on one connection. It is not a shell.
+Lifecycle updates are explicit desired states, not toggles. At least one field is required; omitted fields remain unchanged. `caps` reports lifecycle feature/method support, and lifecycle commands/filters fail explicitly when the server does not advertise support. Session summaries preserve available lifecycle data in `_meta.querymt.lifecycle` and omit it when unavailable.
+
+```sh
+qmacp --quiet get-lifecycle "$SESSION_ID"
+qmacp --quiet set-lifecycle "$SESSION_ID" --resolved true
+qmacp --quiet set-lifecycle "$SESSION_ID" --resolved false --archived true
+qmacp --quiet sessions --resolution open --archive excluded
+qmacp --quiet find --query 'build' --resolution resolved --archive only
+```
+
+`exec` runs several commands on one connection. It is not a shell. Lifecycle commands are supported in `exec` too:
+
+```sh
+qmacp --quiet exec <<EOF
+get-lifecycle $SESSION_ID
+set-lifecycle $SESSION_ID --resolved false
+sessions --resolution open --archive excluded
+EOF
+```
 
 ## Output
 

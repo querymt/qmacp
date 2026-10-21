@@ -5,7 +5,7 @@ use std::time::Duration;
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::client::AcpClient;
 use crate::error::{CliError, ExitCode};
@@ -19,6 +19,40 @@ pub enum Delivery {
     Prompt,
     Steer,
     Queue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ResolutionFilter {
+    Any,
+    Open,
+    Resolved,
+}
+
+impl ResolutionFilter {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::Open => "open",
+            Self::Resolved => "resolved",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ArchiveFilter {
+    Any,
+    Excluded,
+    Only,
+}
+
+impl ArchiveFilter {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::Excluded => "excluded",
+            Self::Only => "only",
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -49,7 +83,7 @@ pub enum Command {
         #[arg(long)]
         effort: Option<String>,
     },
-    /// List sessions with ACP pagination.
+    /// List sessions with ACP pagination and optional lifecycle filters.
     Sessions {
         #[arg(long)]
         cwd: Option<PathBuf>,
@@ -60,8 +94,12 @@ pub enum Command {
         all: bool,
         #[arg(long)]
         limit: Option<usize>,
+        #[arg(long, value_enum)]
+        resolution: Option<ResolutionFilter>,
+        #[arg(long, value_enum)]
+        archive: Option<ArchiveFilter>,
     },
-    /// Client-side search over session/list pages.
+    /// Search sessions by title/id and optionally filter by phase or lifecycle.
     Find {
         #[arg(long)]
         cwd: Option<PathBuf>,
@@ -71,6 +109,20 @@ pub enum Command {
         phase: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        #[arg(long, value_enum)]
+        resolution: Option<ResolutionFilter>,
+        #[arg(long, value_enum)]
+        archive: Option<ArchiveFilter>,
+    },
+    /// Read persisted lifecycle state for a session.
+    GetLifecycle { session_id: String },
+    /// Explicitly patch persisted lifecycle state for a session.
+    SetLifecycle {
+        session_id: String,
+        #[arg(long, action = clap::ArgAction::Set)]
+        resolved: Option<bool>,
+        #[arg(long, action = clap::ArgAction::Set)]
+        archived: Option<bool>,
     },
     /// Compact session history from session/load.
     Inspect {
@@ -205,13 +257,34 @@ pub async fn run(
             cursor,
             all,
             limit,
-        } => write_ok(pretty, sessions(client, cwd, cursor, all, limit).await?),
+            resolution,
+            archive,
+        } => write_ok(
+            pretty,
+            sessions(client, cwd, cursor, all, limit, resolution, archive).await?,
+        ),
         Command::Find {
             cwd,
             query,
             phase,
             limit,
-        } => write_ok(pretty, find(client, cwd, query, phase, limit).await?),
+            resolution,
+            archive,
+        } => write_ok(
+            pretty,
+            find(client, cwd, query, phase, limit, resolution, archive).await?,
+        ),
+        Command::GetLifecycle { session_id } => {
+            write_ok(pretty, get_lifecycle(client, session_id).await?)
+        }
+        Command::SetLifecycle {
+            session_id,
+            resolved,
+            archived,
+        } => write_ok(
+            pretty,
+            set_lifecycle(client, session_id, resolved, archived).await?,
+        ),
         Command::Inspect {
             session_id,
             cwd,
@@ -398,9 +471,15 @@ async fn sessions(
     cursor: Option<String>,
     all: bool,
     limit: Option<usize>,
+    resolution: Option<ResolutionFilter>,
+    archive: Option<ArchiveFilter>,
 ) -> Result<Value, CliError> {
     client.initialize().await.map_err(CliError::from_request)?;
     let cwd = session::resolve_optional_cwd(cwd).map_err(CliError::rpc)?;
+    let filters = lifecycle_filter_meta(resolution, archive);
+    if filters.is_some() {
+        require_lifecycle_support(client, None).await?;
+    }
     let limit = limit.unwrap_or(if all { usize::MAX } else { 20 }).max(1);
     let mut sessions = Vec::new();
     let mut next = cursor;
@@ -416,7 +495,7 @@ async fn sessions(
             }));
         }
         let page = client
-            .list_sessions(cwd.clone(), next.clone())
+            .list_sessions(cwd.clone(), next.clone(), filters.clone())
             .await
             .map_err(CliError::from_request)?;
         for item in page.sessions {
@@ -450,10 +529,16 @@ async fn find(
     query: Option<String>,
     phase: Option<String>,
     limit: usize,
+    resolution: Option<ResolutionFilter>,
+    archive: Option<ArchiveFilter>,
 ) -> Result<Value, CliError> {
     client.initialize().await.map_err(CliError::from_request)?;
     let cwd = session::resolve_optional_cwd(cwd).map_err(CliError::rpc)?;
     let query = query.unwrap_or_default();
+    let filters = lifecycle_filter_meta(resolution, archive);
+    if filters.is_some() {
+        require_lifecycle_support(client, None).await?;
+    }
     let limit = limit.max(1);
     let mut matches = Vec::new();
     let mut next = None;
@@ -464,7 +549,7 @@ async fn find(
             break;
         }
         let page = client
-            .list_sessions(cwd.clone(), next.clone())
+            .list_sessions(cwd.clone(), next.clone(), filters.clone())
             .await
             .map_err(CliError::from_request)?;
         for listed in page.sessions {
@@ -492,6 +577,115 @@ async fn find(
         "cwd": cwd,
         "sessions": matches,
     }))
+}
+
+fn lifecycle_filter_meta(
+    resolution: Option<ResolutionFilter>,
+    archive: Option<ArchiveFilter>,
+) -> Option<Map<String, Value>> {
+    let mut filters = Map::new();
+    if let Some(resolution) = resolution {
+        filters.insert("resolution".to_string(), json!(resolution.as_str()));
+    }
+    if let Some(archive) = archive {
+        filters.insert("archive".to_string(), json!(archive.as_str()));
+    }
+    if filters.is_empty() {
+        return None;
+    }
+
+    let mut querymt = Map::new();
+    querymt.insert("sessionFilters".to_string(), Value::Object(filters));
+    let mut meta = Map::new();
+    meta.insert("querymt".to_string(), Value::Object(querymt));
+    Some(meta)
+}
+
+async fn require_lifecycle_support(
+    client: &AcpClient,
+    method: Option<&str>,
+) -> Result<(), CliError> {
+    client.initialize().await.map_err(CliError::from_request)?;
+    let response = client
+        .extension("querymt/capabilities", json!({}))
+        .await
+        .map_err(|err| {
+            CliError::from_request(err.context("cannot verify session lifecycle support"))
+        })?;
+    let capabilities = extension_payload(&response);
+    validate_lifecycle_support(&capabilities, method)
+}
+
+fn validate_lifecycle_support(capabilities: &Value, method: Option<&str>) -> Result<(), CliError> {
+    if supports_lifecycle(capabilities, method) {
+        return Ok(());
+    }
+    let operation = method.unwrap_or("server-side lifecycle filtering");
+    Err(CliError::rpc(format!(
+        "server does not advertise support for {operation}"
+    )))
+}
+
+fn supports_lifecycle(capabilities: &Value, method: Option<&str>) -> bool {
+    let feature_supported = capabilities
+        .get("features")
+        .and_then(|features| features.get("session_lifecycle"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let method_supported = method.is_none_or(|expected| {
+        capabilities
+            .get("methods")
+            .and_then(Value::as_array)
+            .is_some_and(|methods| methods.iter().any(|value| value.as_str() == Some(expected)))
+    });
+    feature_supported && method_supported
+}
+
+async fn get_lifecycle(client: &AcpClient, session_id: String) -> Result<Value, CliError> {
+    require_lifecycle_support(client, Some("querymt/session/getLifecycle")).await?;
+    let response = client
+        .extension(
+            "querymt/session/getLifecycle",
+            json!({ "session_id": session_id }),
+        )
+        .await
+        .map_err(CliError::from_request)?;
+    Ok(extension_payload(&response))
+}
+
+fn lifecycle_patch_params(
+    session_id: &str,
+    resolved: Option<bool>,
+    archived: Option<bool>,
+) -> Result<Value, CliError> {
+    if resolved.is_none() && archived.is_none() {
+        return Err(CliError::Usage(
+            "set-lifecycle requires --resolved and/or --archived".to_string(),
+        ));
+    }
+    let mut params = json!({ "session_id": session_id });
+    if let Some(resolved) = resolved {
+        params["resolved"] = json!(resolved);
+    }
+    if let Some(archived) = archived {
+        params["archived"] = json!(archived);
+    }
+    Ok(params)
+}
+
+async fn set_lifecycle(
+    client: &AcpClient,
+    session_id: String,
+    resolved: Option<bool>,
+    archived: Option<bool>,
+) -> Result<Value, CliError> {
+    let params = lifecycle_patch_params(&session_id, resolved, archived)?;
+    require_lifecycle_support(client, Some("querymt/session/setLifecycle")).await?;
+    let response = client
+        .extension("querymt/session/setLifecycle", params)
+        .await
+        .map_err(CliError::from_request)?;
+    Ok(extension_payload(&response))
 }
 
 async fn inspect(
@@ -1182,6 +1376,92 @@ fn stop_reason_name(reason: &acp::StopReason) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_capabilities_require_feature_and_operation_method() {
+        let capabilities = json!({
+            "features": { "session_lifecycle": true },
+            "methods": [
+                "querymt/session/getLifecycle",
+                "querymt/session/setLifecycle"
+            ]
+        });
+        assert!(supports_lifecycle(
+            &capabilities,
+            Some("querymt/session/getLifecycle")
+        ));
+        assert!(!supports_lifecycle(
+            &capabilities,
+            Some("querymt/session/unknown")
+        ));
+        assert!(!supports_lifecycle(
+            &json!({ "features": { "session_lifecycle": false } }),
+            None
+        ));
+    }
+
+    #[test]
+    fn unsupported_lifecycle_capabilities_are_rejected_explicitly() {
+        assert!(matches!(
+            validate_lifecycle_support(
+                &json!({ "features": { "session_lifecycle": false } }),
+                None
+            ),
+            Err(CliError::Rpc(message))
+                if message == "server does not advertise support for server-side lifecycle filtering"
+        ));
+        assert!(matches!(
+            validate_lifecycle_support(
+                &json!({
+                    "features": { "session_lifecycle": true },
+                    "methods": ["querymt/session/getLifecycle"]
+                }),
+                Some("querymt/session/setLifecycle")
+            ),
+            Err(CliError::Rpc(message))
+                if message == "server does not advertise support for querymt/session/setLifecycle"
+        ));
+    }
+
+    #[test]
+    fn lifecycle_patch_preserves_explicit_false_and_rejects_empty_patch() {
+        assert_eq!(
+            lifecycle_patch_params("session-1", Some(false), None).unwrap(),
+            json!({ "session_id": "session-1", "resolved": false })
+        );
+        assert!(matches!(
+            lifecycle_patch_params("session-1", None, None),
+            Err(CliError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn exec_line_parses_lifecycle_commands_and_explicit_false() {
+        assert!(matches!(
+            parse_exec_line("get-lifecycle session-1").unwrap(),
+            Command::GetLifecycle { session_id } if session_id == "session-1"
+        ));
+        assert!(matches!(
+            parse_exec_line("set-lifecycle session-1 --resolved false").unwrap(),
+            Command::SetLifecycle { session_id, resolved: Some(false), archived: None }
+                if session_id == "session-1"
+        ));
+        assert!(matches!(
+            parse_exec_line("find --resolution open --archive excluded").unwrap(),
+            Command::Find {
+                resolution: Some(ResolutionFilter::Open),
+                archive: Some(ArchiveFilter::Excluded),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn lifecycle_filters_omit_metadata_when_unspecified_and_keep_any_when_explicit() {
+        assert!(lifecycle_filter_meta(None, None).is_none());
+        let filters = lifecycle_filter_meta(Some(ResolutionFilter::Any), None).unwrap();
+        assert_eq!(filters["querymt"]["sessionFilters"]["resolution"], "any");
+    }
 
     #[test]
     fn prompt_new_uses_remaining_args_as_text() {
