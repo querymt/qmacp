@@ -55,6 +55,13 @@ impl ArchiveFilter {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SessionFilterOptions {
+    resolution: Option<ResolutionFilter>,
+    archive: Option<ArchiveFilter>,
+    pinned: Option<bool>,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Protocol version, agent info, ACP session features, and QueryMT capabilities.
@@ -83,7 +90,7 @@ pub enum Command {
         #[arg(long)]
         effort: Option<String>,
     },
-    /// List sessions with ACP pagination and optional lifecycle filters.
+    /// List sessions with ACP pagination and optional lifecycle or pin filters.
     Sessions {
         #[arg(long)]
         cwd: Option<PathBuf>,
@@ -98,8 +105,10 @@ pub enum Command {
         resolution: Option<ResolutionFilter>,
         #[arg(long, value_enum)]
         archive: Option<ArchiveFilter>,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true, action = clap::ArgAction::Set)]
+        pinned: Option<bool>,
     },
-    /// Search sessions by title/id and optionally filter by phase or lifecycle.
+    /// Search sessions by title/id and optionally filter by phase, lifecycle, or pin.
     Find {
         #[arg(long)]
         cwd: Option<PathBuf>,
@@ -113,6 +122,8 @@ pub enum Command {
         resolution: Option<ResolutionFilter>,
         #[arg(long, value_enum)]
         archive: Option<ArchiveFilter>,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true, action = clap::ArgAction::Set)]
+        pinned: Option<bool>,
     },
     /// Read persisted lifecycle state for a session.
     GetLifecycle { session_id: String },
@@ -124,6 +135,10 @@ pub enum Command {
         #[arg(long, action = clap::ArgAction::Set)]
         archived: Option<bool>,
     },
+    /// Pin a session.
+    Pin { session_id: String },
+    /// Unpin a session.
+    Unpin { session_id: String },
     /// Compact session history from session/load.
     Inspect {
         session_id: String,
@@ -259,9 +274,22 @@ pub async fn run(
             limit,
             resolution,
             archive,
+            pinned,
         } => write_ok(
             pretty,
-            sessions(client, cwd, cursor, all, limit, resolution, archive).await?,
+            sessions(
+                client,
+                cwd,
+                cursor,
+                all,
+                limit,
+                SessionFilterOptions {
+                    resolution,
+                    archive,
+                    pinned,
+                },
+            )
+            .await?,
         ),
         Command::Find {
             cwd,
@@ -270,9 +298,22 @@ pub async fn run(
             limit,
             resolution,
             archive,
+            pinned,
         } => write_ok(
             pretty,
-            find(client, cwd, query, phase, limit, resolution, archive).await?,
+            find(
+                client,
+                cwd,
+                query,
+                phase,
+                limit,
+                SessionFilterOptions {
+                    resolution,
+                    archive,
+                    pinned,
+                },
+            )
+            .await?,
         ),
         Command::GetLifecycle { session_id } => {
             write_ok(pretty, get_lifecycle(client, session_id).await?)
@@ -285,6 +326,12 @@ pub async fn run(
             pretty,
             set_lifecycle(client, session_id, resolved, archived).await?,
         ),
+        Command::Pin { session_id } => {
+            write_ok(pretty, set_pinned(client, session_id, true).await?)
+        }
+        Command::Unpin { session_id } => {
+            write_ok(pretty, set_pinned(client, session_id, false).await?)
+        }
         Command::Inspect {
             session_id,
             cwd,
@@ -471,14 +518,22 @@ async fn sessions(
     cursor: Option<String>,
     all: bool,
     limit: Option<usize>,
-    resolution: Option<ResolutionFilter>,
-    archive: Option<ArchiveFilter>,
+    filter_options: SessionFilterOptions,
 ) -> Result<Value, CliError> {
+    let SessionFilterOptions {
+        resolution,
+        archive,
+        pinned,
+    } = filter_options;
     client.initialize().await.map_err(CliError::from_request)?;
     let cwd = session::resolve_optional_cwd(cwd).map_err(CliError::rpc)?;
-    let filters = lifecycle_filter_meta(resolution, archive);
-    if filters.is_some() {
+    let has_lifecycle_filters = resolution.is_some() || archive.is_some();
+    let filters = session_filter_meta(resolution, archive, pinned);
+    if has_lifecycle_filters {
         require_lifecycle_support(client, None).await?;
+    }
+    if pinned.is_some() {
+        require_pin_support(client, None).await?;
     }
     let limit = limit.unwrap_or(if all { usize::MAX } else { 20 }).max(1);
     let mut sessions = Vec::new();
@@ -529,15 +584,23 @@ async fn find(
     query: Option<String>,
     phase: Option<String>,
     limit: usize,
-    resolution: Option<ResolutionFilter>,
-    archive: Option<ArchiveFilter>,
+    filter_options: SessionFilterOptions,
 ) -> Result<Value, CliError> {
+    let SessionFilterOptions {
+        resolution,
+        archive,
+        pinned,
+    } = filter_options;
     client.initialize().await.map_err(CliError::from_request)?;
     let cwd = session::resolve_optional_cwd(cwd).map_err(CliError::rpc)?;
     let query = query.unwrap_or_default();
-    let filters = lifecycle_filter_meta(resolution, archive);
-    if filters.is_some() {
+    let has_lifecycle_filters = resolution.is_some() || archive.is_some();
+    let filters = session_filter_meta(resolution, archive, pinned);
+    if has_lifecycle_filters {
         require_lifecycle_support(client, None).await?;
+    }
+    if pinned.is_some() {
+        require_pin_support(client, None).await?;
     }
     let limit = limit.max(1);
     let mut matches = Vec::new();
@@ -579,9 +642,10 @@ async fn find(
     }))
 }
 
-fn lifecycle_filter_meta(
+fn session_filter_meta(
     resolution: Option<ResolutionFilter>,
     archive: Option<ArchiveFilter>,
+    pinned: Option<bool>,
 ) -> Option<Map<String, Value>> {
     let mut filters = Map::new();
     if let Some(resolution) = resolution {
@@ -589,6 +653,9 @@ fn lifecycle_filter_meta(
     }
     if let Some(archive) = archive {
         filters.insert("archive".to_string(), json!(archive.as_str()));
+    }
+    if let Some(pinned) = pinned {
+        filters.insert("pinned".to_string(), json!(pinned));
     }
     if filters.is_empty() {
         return None;
@@ -630,6 +697,41 @@ fn supports_lifecycle(capabilities: &Value, method: Option<&str>) -> bool {
     let feature_supported = capabilities
         .get("features")
         .and_then(|features| features.get("session_lifecycle"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let method_supported = method.is_none_or(|expected| {
+        capabilities
+            .get("methods")
+            .and_then(Value::as_array)
+            .is_some_and(|methods| methods.iter().any(|value| value.as_str() == Some(expected)))
+    });
+    feature_supported && method_supported
+}
+
+async fn require_pin_support(client: &AcpClient, method: Option<&str>) -> Result<(), CliError> {
+    client.initialize().await.map_err(CliError::from_request)?;
+    let response = client
+        .extension("querymt/capabilities", json!({}))
+        .await
+        .map_err(|err| CliError::from_request(err.context("cannot verify session pin support")))?;
+    let capabilities = extension_payload(&response);
+    validate_pin_support(&capabilities, method)
+}
+
+fn validate_pin_support(capabilities: &Value, method: Option<&str>) -> Result<(), CliError> {
+    if supports_pin(capabilities, method) {
+        return Ok(());
+    }
+    let operation = method.unwrap_or("server-side pin filtering");
+    Err(CliError::rpc(format!(
+        "server does not advertise support for {operation}"
+    )))
+}
+
+fn supports_pin(capabilities: &Value, method: Option<&str>) -> bool {
+    let feature_supported = capabilities
+        .get("features")
+        .and_then(|features| features.get("session_pins"))
         .and_then(Value::as_bool)
         == Some(true);
     let method_supported = method.is_none_or(|expected| {
@@ -683,6 +785,22 @@ async fn set_lifecycle(
     require_lifecycle_support(client, Some("querymt/session/setLifecycle")).await?;
     let response = client
         .extension("querymt/session/setLifecycle", params)
+        .await
+        .map_err(CliError::from_request)?;
+    Ok(extension_payload(&response))
+}
+
+async fn set_pinned(
+    client: &AcpClient,
+    session_id: String,
+    pinned: bool,
+) -> Result<Value, CliError> {
+    require_pin_support(client, Some("querymt/session/setPinned")).await?;
+    let response = client
+        .extension(
+            "querymt/session/setPinned",
+            json!({ "session_id": session_id, "pinned": pinned }),
+        )
         .await
         .map_err(CliError::from_request)?;
     Ok(extension_payload(&response))
@@ -1401,6 +1519,27 @@ mod tests {
     }
 
     #[test]
+    fn pin_capabilities_require_feature_and_operation_method() {
+        let capabilities = json!({
+            "features": { "session_pins": true },
+            "methods": ["querymt/session/setPinned"]
+        });
+        assert!(supports_pin(
+            &capabilities,
+            Some("querymt/session/setPinned")
+        ));
+        assert!(supports_pin(&capabilities, None));
+        assert!(!supports_pin(
+            &json!({ "features": { "session_pins": true } }),
+            Some("querymt/session/setPinned")
+        ));
+        assert!(!supports_pin(
+            &json!({ "features": { "session_pins": false } }),
+            None
+        ));
+    }
+
+    #[test]
     fn unsupported_lifecycle_capabilities_are_rejected_explicitly() {
         assert!(matches!(
             validate_lifecycle_support(
@@ -1447,6 +1586,28 @@ mod tests {
                 if session_id == "session-1"
         ));
         assert!(matches!(
+            parse_exec_line("pin session-1").unwrap(),
+            Command::Pin { session_id } if session_id == "session-1"
+        ));
+        assert!(matches!(
+            parse_exec_line("unpin session-1").unwrap(),
+            Command::Unpin { session_id } if session_id == "session-1"
+        ));
+        assert!(matches!(
+            parse_exec_line("sessions --pinned").unwrap(),
+            Command::Sessions {
+                pinned: Some(true),
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_exec_line("find --pinned=false").unwrap(),
+            Command::Find {
+                pinned: Some(false),
+                ..
+            }
+        ));
+        assert!(matches!(
             parse_exec_line("find --resolution open --archive excluded").unwrap(),
             Command::Find {
                 resolution: Some(ResolutionFilter::Open),
@@ -1457,10 +1618,13 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_filters_omit_metadata_when_unspecified_and_keep_any_when_explicit() {
-        assert!(lifecycle_filter_meta(None, None).is_none());
-        let filters = lifecycle_filter_meta(Some(ResolutionFilter::Any), None).unwrap();
+    fn session_filters_omit_metadata_when_unspecified_and_preserve_pin_boolean() {
+        assert!(session_filter_meta(None, None, None).is_none());
+        let filters = session_filter_meta(Some(ResolutionFilter::Any), None, Some(false)).unwrap();
         assert_eq!(filters["querymt"]["sessionFilters"]["resolution"], "any");
+        assert_eq!(filters["querymt"]["sessionFilters"]["pinned"], false);
+        let pinned = session_filter_meta(None, None, Some(true)).unwrap();
+        assert_eq!(pinned["querymt"]["sessionFilters"]["pinned"], true);
     }
 
     #[test]
