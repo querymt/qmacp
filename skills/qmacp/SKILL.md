@@ -1,5 +1,5 @@
 ---
-name: qmtacp
+name: qmacp
 description: "JSON CLI for a running QueryMT ACP WebSocket server (qmtcode --acp-ws). Find/create sessions, prompt, follow, steer, queue, configure, cancel, and inspect live protocol behavior. Use for operating live sessions and for testing/developing qmtcode."
 license: MIT
 compatibility: "Requires the qmacp binary on PATH and a running qmtcode --acp-ws. Uses the shell."
