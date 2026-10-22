@@ -34,6 +34,15 @@ impl CliError {
         Self::Rpc(error.to_string())
     }
 
+    /// Classify notification write failures without changing non-timeout RPC errors.
+    pub fn from_notification(error: anyhow::Error) -> Self {
+        if error.is::<tokio::time::error::Elapsed>() {
+            Self::Timeout(error.to_string())
+        } else {
+            Self::rpc(error)
+        }
+    }
+
     pub fn from_request(error: anyhow::Error) -> Self {
         let message = format!("{error:#}");
         if message.contains("timed out") {
@@ -84,3 +93,24 @@ impl fmt::Display for CliError {
 }
 
 impl std::error::Error for CliError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notification_errors_preserve_existing_rpc_classification() {
+        for message in [
+            "WebSocket writer is closed",
+            "WebSocket writer stopped before flushing notification",
+            "WebSocket write failed: connection reset",
+            "WebSocket write failed: operation timed out",
+            "remote service reported a timeout",
+        ] {
+            let error = CliError::from_notification(anyhow::anyhow!(message));
+            assert!(matches!(error, CliError::Rpc(_)));
+            assert_eq!(error.exit_code().as_i32(), 3);
+            assert_eq!(error.to_string(), message);
+        }
+    }
+}

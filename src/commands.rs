@@ -7,10 +7,10 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Map, Value, json};
 
-use crate::client::AcpClient;
-use crate::error::{CliError, ExitCode};
-use crate::output;
-use crate::session;
+use qmacp::client::AcpClient;
+use qmacp::error::{CliError, ExitCode};
+use qmacp::output;
+use qmacp::session;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 pub enum Delivery {
@@ -1349,7 +1349,10 @@ async fn discard_queued(
 
 async fn cancel(client: &AcpClient, session_id: String) -> Result<Value, CliError> {
     client.initialize().await.map_err(CliError::from_request)?;
-    client.cancel(session_id.clone()).map_err(CliError::rpc)?;
+    client
+        .cancel(session_id.clone())
+        .await
+        .map_err(CliError::from_notification)?;
     Ok(json!({
         "sessionId": session_id,
         "cancelled": true,

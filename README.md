@@ -98,3 +98,49 @@ Exit codes: 0 ok, 1 usage, 2 connection, 3 RPC, 4 timeout or cancel.
 Event types: `session`, `text`, `tool`, `mode`, `plan`, `input_state`, `permission`, `elicitation`, `runtime`, `update`, `done`.
 
 Elicitation is cancelled and emitted as an event.
+
+## Library
+
+The `qmacp` crate also exports its native ACP client and shared session helpers.
+Embedded callers can receive compact events without writing to stdout:
+
+```rust,no_run
+use qmacp::{client::AcpClient, policy::PermissionPolicy};
+
+# async fn example() -> anyhow::Result<()> {
+let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
+let events = tokio::spawn(async move {
+    while let Some(event) = events_rx.recv().await {
+        // Forward or collect events; do not write them to an MCP stdout stream.
+        drop(event);
+    }
+});
+let client = AcpClient::connect_with_events(
+    "ws://127.0.0.1:3030/acp/ws",
+    "127.0.0.1:3030/acp/ws",
+    PermissionPolicy::Cancel,
+    events_tx,
+).await?;
+let initialized = client.initialize().await?;
+assert_eq!(initialized.protocol_version, qmacp::protocol::schema::ProtocolVersion::V1);
+drop(client);
+events.await?;
+# Ok(())
+# }
+```
+
+The caller must continuously drain the bounded event receiver while operations
+are running. Library-mode assistant text is limited to 1 MiB and reports
+truncation through `text_truncated()`. `connect(..., stream_events)` retains the
+CLI event sink and unbounded assistant text behavior. The CLI and library use
+the same implementation of WebSocket RPCs, permissions, and event parsing.
+
+Dropping a client aborts its reader/writer tasks and releases the connection;
+it does not cancel remote work or close the remote session. Explicit
+`cancel(session_id).await` waits until its ACP notification has been written,
+not until the remote turn has stopped. URL normalization and endpoint redaction
+are available in `qmacp::url`, and ACP schema types in `qmacp::protocol`.
+
+Secure WebSockets use native trust roots and an explicit connection-local ring
+provider. The library does not install or replace rustls's process-wide crypto
+provider, even when an embedding application also enables AWS-LC.

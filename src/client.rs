@@ -11,10 +11,12 @@ use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    Connector, connect_async_tls_with_config,
+    tungstenite::{Message, client::IntoClientRequest},
+};
 
 use crate::events;
-use crate::output;
 use crate::policy::{self, PermissionPolicy};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -23,23 +25,123 @@ const DEFAULT_PROMPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 type RpcResult = Result<Value, String>;
 type PendingRequests = Arc<Mutex<HashMap<i64, oneshot::Sender<RpcResult>>>>;
+type Outbound = (Message, Option<oneshot::Sender<Result<(), String>>>);
 
+#[derive(Default)]
+struct AssistantText {
+    text: String,
+    truncated: bool,
+    limit: Option<usize>,
+}
+
+impl AssistantText {
+    fn observe(&mut self, event: &Value) {
+        if self.truncated {
+            return;
+        }
+        events::observe_assistant_text(&mut self.text, event);
+        if let Some(limit) = self.limit
+            && self.text.len() > limit
+        {
+            let mut end = limit;
+            while !self.text.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.text.truncate(end);
+            self.truncated = true;
+        }
+    }
+}
+
+#[derive(Clone)]
+enum EventSink {
+    Cli(bool),
+    Channel(mpsc::Sender<Value>),
+}
+
+impl EventSink {
+    fn enabled(&self) -> bool {
+        !matches!(self, Self::Cli(false))
+    }
+
+    async fn emit(&self, event: Value) {
+        match self {
+            Self::Cli(true) => {
+                let _ = crate::output::write_event(&event);
+            }
+            Self::Cli(false) => {}
+            Self::Channel(sender) => {
+                let _ = sender.send(event).await;
+            }
+        }
+    }
+}
+
+/// Native ACP WebSocket client. Dropping it closes only its connection, not the remote session.
 pub struct AcpClient {
-    tx: mpsc::UnboundedSender<Message>,
+    tx: mpsc::UnboundedSender<Outbound>,
     pending: PendingRequests,
     next_id: AtomicI64,
     initialized: Mutex<Option<acp::InitializeResponse>>,
-    assistant_text: Arc<Mutex<String>>,
+    assistant_text: Arc<Mutex<AssistantText>>,
+    event_sink: EventSink,
+    tasks: [tokio::task::JoinHandle<()>; 2],
 }
 
 impl AcpClient {
+    /// Connect using the CLI event sink. With stream_events=true, events go to stdout.
     pub async fn connect(
         url: &str,
         endpoint: &str,
         permission: PermissionPolicy,
         stream_events: bool,
     ) -> Result<Self> {
-        let (socket, _) = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(url))
+        Self::connect_inner(
+            url,
+            endpoint,
+            permission,
+            EventSink::Cli(stream_events),
+            None,
+        )
+        .await
+    }
+
+    /// Connect without writing events to stdout. The caller must drain the bounded receiver.
+    /// Assistant text is capped at 1 MiB; inspect text_truncated() after an operation.
+    pub async fn connect_with_events(
+        url: &str,
+        endpoint: &str,
+        permission: PermissionPolicy,
+        event_tx: mpsc::Sender<Value>,
+    ) -> Result<Self> {
+        Self::connect_inner(
+            url,
+            endpoint,
+            permission,
+            EventSink::Channel(event_tx),
+            Some(1024 * 1024),
+        )
+        .await
+    }
+
+    async fn connect_inner(
+        url: &str,
+        endpoint: &str,
+        permission: PermissionPolicy,
+        event_sink: EventSink,
+        text_limit: Option<usize>,
+    ) -> Result<Self> {
+        let connect = async {
+            let request = url.into_client_request()?;
+            let connector = match request.uri().scheme_str() {
+                Some("wss") => Some(native_tls_connector()?),
+                _ => None,
+            };
+            Ok::<_, anyhow::Error>(
+                connect_async_tls_with_config(request, None, false, connector).await?,
+            )
+        };
+        let (socket, _) = tokio::time::timeout(CONNECT_TIMEOUT, connect)
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
@@ -49,14 +151,21 @@ impl AcpClient {
             })?
             .with_context(|| format!("connect {endpoint}"))?;
         let (mut write, mut read) = socket.split();
-        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Outbound>();
         let pending: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
 
         let pending_write = pending.clone();
-        tokio::spawn(async move {
-            while let Some(message) = rx.recv().await {
-                if let Err(err) = write.send(message).await {
-                    fail_pending(&pending_write, format!("WebSocket write failed: {err}")).await;
+        let writer = tokio::spawn(async move {
+            while let Some((message, ack)) = rx.recv().await {
+                let result = write
+                    .send(message)
+                    .await
+                    .map_err(|error| format!("WebSocket write failed: {error}"));
+                if let Some(ack) = ack {
+                    let _ = ack.send(result.clone());
+                }
+                if let Err(error) = result {
+                    fail_pending(&pending_write, error).await;
                     return;
                 }
             }
@@ -65,9 +174,13 @@ impl AcpClient {
 
         let pending_read = pending.clone();
         let tx_read = tx.clone();
-        let assistant_text = Arc::new(Mutex::new(String::new()));
+        let assistant_text = Arc::new(Mutex::new(AssistantText {
+            limit: text_limit,
+            ..Default::default()
+        }));
         let assistant_read = assistant_text.clone();
-        tokio::spawn(async move {
+        let events_read = event_sink.clone();
+        let reader = tokio::spawn(async move {
             while let Some(message) = read.next().await {
                 match message {
                     Ok(Message::Text(text)) => {
@@ -77,7 +190,7 @@ impl AcpClient {
                             &assistant_read,
                             text.as_ref(),
                             permission,
-                            stream_events,
+                            &events_read,
                         )
                         .await
                         {
@@ -85,6 +198,11 @@ impl AcpClient {
                         }
                     }
                     Ok(Message::Close(_)) => break,
+                    Ok(Message::Ping(data)) => {
+                        if tx_read.send((Message::Pong(data), None)).is_err() {
+                            break;
+                        }
+                    }
                     Ok(_) => {}
                     Err(err) => {
                         eprintln!("WebSocket read failed: {err}");
@@ -101,16 +219,32 @@ impl AcpClient {
             next_id: AtomicI64::new(1),
             initialized: Mutex::new(None),
             assistant_text,
+            event_sink,
+            tasks: [writer, reader],
         })
+    }
+
+    pub async fn emit(&self, event: Value) {
+        self.event_sink.emit(event).await;
+    }
+
+    pub async fn clear_assistant_text(&self) {
+        let mut buffer = self.assistant_text.lock().await;
+        buffer.text.clear();
+        buffer.truncated = false;
+    }
+
+    pub async fn snapshot_assistant_text(&self) -> String {
+        self.assistant_text.lock().await.text.clone()
+    }
+
+    pub async fn text_truncated(&self) -> bool {
+        self.assistant_text.lock().await.truncated
     }
 
     pub async fn take_assistant_text(&self) -> String {
         let mut text = self.assistant_text.lock().await;
-        std::mem::take(&mut *text)
-    }
-
-    pub async fn snapshot_assistant_text(&self) -> String {
-        self.assistant_text.lock().await.clone()
+        std::mem::take(&mut text.text)
     }
 
     pub async fn initialize(&self) -> Result<acp::InitializeResponse> {
@@ -221,8 +355,8 @@ impl AcpClient {
         .await
     }
 
-    pub fn cancel(&self, session_id: String) -> Result<()> {
-        self.notify(acp::CancelNotification::new(session_id))
+    pub async fn cancel(&self, session_id: String) -> Result<()> {
+        self.notify(acp::CancelNotification::new(session_id)).await
     }
 
     async fn request<R>(&self, request: R) -> Result<R::Response>
@@ -265,7 +399,7 @@ impl AcpClient {
         Ok((typed, result))
     }
 
-    fn notify<N>(&self, notification: N) -> Result<()>
+    async fn notify<N>(&self, notification: N) -> Result<()>
     where
         N: JsonRpcNotification + Send + Sync + 'static,
     {
@@ -275,10 +409,16 @@ impl AcpClient {
             "method": message.method,
             "params": message.params,
         });
+        let (ack_tx, ack_rx) = oneshot::channel();
         self.tx
-            .send(Message::Text(envelope.to_string().into()))
+            .send((Message::Text(envelope.to_string().into()), Some(ack_tx)))
             .context("WebSocket writer is closed")?;
-        Ok(())
+        // Flush notifications before this per-call client is dropped.
+        tokio::time::timeout(REQUEST_TIMEOUT, ack_rx)
+            .await
+            .context("WebSocket notification write timed out")?
+            .context("WebSocket writer stopped before flushing notification")?
+            .map_err(anyhow::Error::msg)
     }
 
     async fn request_raw(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
@@ -293,7 +433,7 @@ impl AcpClient {
         });
         if self
             .tx
-            .send(Message::Text(envelope.to_string().into()))
+            .send((Message::Text(envelope.to_string().into()), None))
             .is_err()
         {
             self.pending.lock().await.remove(&id);
@@ -308,6 +448,40 @@ impl AcpClient {
             }
         }
     }
+}
+
+impl Drop for AcpClient {
+    fn drop(&mut self) {
+        // A tool call owns its connection; cancellation must not leave reader/writer tasks alive.
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+fn native_tls_connector() -> Result<Connector> {
+    let certificates = rustls_native_certs::load_native_certs();
+    if certificates.certs.is_empty() {
+        bail!(
+            "no native root CA certificates found (errors: {:?})",
+            certificates.errors
+        );
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    let (added, _) = roots.add_parsable_certificates(certificates.certs);
+    if added == 0 {
+        bail!("no usable native root CA certificates found");
+    }
+    // Cargo features are additive. Select ring for this connection explicitly,
+    // without relying on or changing the embedding application's global provider.
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .context("configure TLS protocol versions")?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(Connector::Rustls(Arc::new(config)))
 }
 
 fn build_list_sessions_request(
@@ -337,11 +511,11 @@ async fn fail_pending(pending: &PendingRequests, message: impl Into<String>) {
 
 async fn handle_inbound(
     pending: &PendingRequests,
-    tx: &mpsc::UnboundedSender<Message>,
-    assistant_text: &Mutex<String>,
+    tx: &mpsc::UnboundedSender<Outbound>,
+    assistant_text: &Mutex<AssistantText>,
     text: &str,
     permission: PermissionPolicy,
-    stream_events: bool,
+    event_sink: &EventSink,
 ) -> Result<()> {
     let value: Value = serde_json::from_str(text).context("inbound JSON")?;
     if value.get("method").is_none() {
@@ -365,29 +539,27 @@ async fn handle_inbound(
         .unwrap_or_default()
         .to_string();
     let params = value.get("params").cloned().unwrap_or(Value::Null);
-    if stream_events && method == "session/update" {
+    if event_sink.enabled() && method == "session/update" {
         let session_id = params.get("sessionId").cloned().unwrap_or(Value::Null);
         let update = params.get("update").cloned().unwrap_or(Value::Null);
         if let Some(event) = events::compact_session_update(&session_id, &update) {
-            events::observe_assistant_text(&mut *assistant_text.lock().await, &event);
-            let _ = output::write_event(&event);
+            assistant_text.lock().await.observe(&event);
+            event_sink.emit(event).await;
         }
-    } else if stream_events
-        && matches!(
-            method.as_str(),
-            "querymt/session/inputState" | "_querymt/session/inputState"
-        )
-        && let Some(event) = events::compact_input_state(&params)
+    } else if matches!(
+        method.as_str(),
+        "querymt/session/inputState" | "_querymt/session/inputState"
+    ) && let Some(event) = events::compact_input_state(&params)
     {
-        let _ = output::write_event(&event);
+        event_sink.emit(event).await;
     }
 
     if let Some(id) = value.get("id").cloned() {
         let (reply, event) = inbound_request_reply(id, &method, &params, permission)?;
-        if stream_events && let Some(event) = event {
-            let _ = output::write_event(&event);
+        if let Some(event) = event {
+            event_sink.emit(event).await;
         }
-        tx.send(Message::Text(reply.to_string().into()))
+        tx.send((Message::Text(reply.to_string().into()), None))
             .context("reply to inbound request")?;
     }
     Ok(())
@@ -436,6 +608,81 @@ fn client_capabilities() -> acp::ClientCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_write_deadline_is_classified_as_timeout() {
+        use crate::error::{CliError, ExitCode};
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<Outbound>();
+        let writer = tokio::spawn(async move {
+            let (message, ack) = rx.recv().await.unwrap();
+            let message: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+            assert_eq!(message["method"], "session/cancel");
+            let ack = ack.unwrap();
+            // Keep the acknowledgment alive, simulating a writer stalled in send().
+            std::future::pending::<()>().await;
+            drop(ack);
+        });
+        let client = AcpClient {
+            tx,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: AtomicI64::new(1),
+            initialized: Mutex::new(None),
+            assistant_text: Arc::new(Mutex::new(AssistantText::default())),
+            event_sink: EventSink::Cli(false),
+            tasks: [writer, tokio::spawn(std::future::pending())],
+        };
+        let started = tokio::time::Instant::now();
+        let error = client.cancel("fixture-session".into()).await.unwrap_err();
+        assert_eq!(started.elapsed(), REQUEST_TIMEOUT);
+        assert!(error.is::<tokio::time::error::Elapsed>());
+        let error = CliError::from_notification(error);
+        assert_eq!(error.exit_code(), ExitCode::Timeout);
+        assert_eq!(error.exit_code().as_i32(), 4);
+        assert!(
+            error
+                .to_string()
+                .contains("WebSocket notification write timed out")
+        );
+    }
+
+    #[tokio::test]
+    async fn secure_websocket_starts_a_tls_handshake_without_panicking() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("wss://{}/acp/ws", listener.local_addr().unwrap());
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut first_byte = [0];
+            tokio::time::timeout(Duration::from_secs(2), socket.read_exact(&mut first_byte))
+                .await
+                .unwrap()
+                .unwrap();
+            first_byte[0]
+        });
+        let (tx, _rx) = mpsc::channel(1);
+        let result =
+            AcpClient::connect_with_events(&url, "fixture", PermissionPolicy::Cancel, tx).await;
+        assert!(result.is_err(), "the fixture closes before completing TLS");
+        assert_eq!(
+            peer.await.unwrap(),
+            22,
+            "the first TLS record must be a handshake"
+        );
+    }
+
+    #[test]
+    fn bounded_assistant_text_preserves_a_utf8_prefix_and_reports_truncation() {
+        let mut buffer = AssistantText {
+            limit: Some(5),
+            ..Default::default()
+        };
+        buffer.observe(&json!({"type": "text", "role": "assistant", "text": "\u{e9}\u{e9}\u{e9}"}));
+        assert_eq!(buffer.text, "\u{e9}\u{e9}");
+        assert!(buffer.truncated);
+        buffer.observe(&json!({"type": "text", "role": "assistant", "text": "later"}));
+        assert_eq!(buffer.text, "\u{e9}\u{e9}");
+    }
 
     #[test]
     fn list_sessions_request_repeats_filters_on_each_cursor_and_omits_empty_metadata() {

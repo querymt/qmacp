@@ -1,11 +1,6 @@
-mod client;
 mod commands;
-mod error;
-mod events;
-mod output;
-mod policy;
-mod session;
-mod url;
+
+use qmacp::{client, error, output, policy, url};
 
 use std::process::ExitCode as ProcessExitCode;
 
