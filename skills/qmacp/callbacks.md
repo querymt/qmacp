@@ -99,7 +99,7 @@ EOF
   queues. For non-urgent results to a known-busy session, `queue` avoids
   steering; `steer --run-id` can target an exact active run. Do not assume
   queue-only delivery wakes an idle session. See [live control](control.md)
-  for direct commands.
+  for direct commands, including stdin delivery without history loading.
 - `--until-idle false` avoids waiting for all subsequent work after
   steer/queue. It is **not** fire-and-forget for an idle session: the prompt
   RPC still waits for that turn, bounded here by `--timeout 900`. Keep the
@@ -107,8 +107,8 @@ EOF
 - Keep stdout NDJSON and stderr in the watcher logs; check exit status and the
   final `done` event. Submission/`done` alone does not prove the agent handled
   this callback. Have the agent record the event ID and outcome in the task
-  notes. Direct `queue`/`steer` also return a `clientInputId` for transport
-  tracking; that is separate from `CALLBACK_ID`.
+  notes. Keep the transport `clientInputId` separately from `CALLBACK_ID`;
+  see [CLI output](cli.md#output) for receipt and recovery fields.
 - A timeout or disconnect can happen after acceptance. Inspect `runtime` and
   session history before resending; do not automatically replay the event with
   a fresh ID. The stable event ID is an agent-side deduplication convention,

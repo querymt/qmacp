@@ -5,7 +5,7 @@ license: MIT
 compatibility: "Requires the qmacp binary on PATH and a running qmtcode --acp-ws. Uses the shell."
 allowed-tools: shell
 metadata:
-  version: "0.2.0"
+  version: "0.2.1"
   tags: "querymt acp sessions automation orchestration callbacks qmtcode"
 ---
 
@@ -31,7 +31,8 @@ keep the returned `sessionId`. Default endpoint: `ws://127.0.0.1:3030/acp/ws`.
   Do not use `--pretty` on streams. Acceptance is not proof of task completion.
 - After a timeout or uncertain submission, inspect `runtime` and history before
   retrying, steering, queuing, discarding, or cancelling. Do not claim changes
-  succeeded without exit 0 and JSON `ok: true`.
+  succeeded without exit 0 and JSON `ok: true`. Retain receipts and error
+  `recovery` IDs before retrying; see [CLI output](cli.md#output).
 
 ## Default path
 

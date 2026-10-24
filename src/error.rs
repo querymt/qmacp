@@ -27,9 +27,41 @@ pub enum CliError {
     Connection(String),
     Rpc(String),
     Timeout(String),
+    /// An operation failed after acquiring identifiers needed for safe recovery.
+    Recovery {
+        source: Box<CliError>,
+        context: serde_json::Value,
+    },
 }
 
 impl CliError {
+    /// Attach recovery data without changing the error's message or exit code.
+    pub fn with_recovery(self, mut context: serde_json::Value) -> Self {
+        match self {
+            Self::Recovery {
+                source,
+                context: known,
+            } => {
+                if let (Some(context), Some(known)) = (context.as_object_mut(), known.as_object()) {
+                    context.extend(known.clone());
+                }
+                Self::Recovery { source, context }
+            }
+            source => Self::Recovery {
+                source: Box::new(source),
+                context,
+            },
+        }
+    }
+
+    /// Identifiers and delivery state available after a partial operation.
+    pub fn recovery(&self) -> Option<&serde_json::Value> {
+        match self {
+            Self::Recovery { context, .. } => Some(context),
+            _ => None,
+        }
+    }
+
     pub fn rpc(error: impl ToString) -> Self {
         Self::Rpc(error.to_string())
     }
@@ -45,7 +77,9 @@ impl CliError {
 
     pub fn from_request(error: anyhow::Error) -> Self {
         let message = format!("{error:#}");
-        if message.contains("timed out") {
+        if error.is::<crate::client::RpcResponseError>() {
+            Self::Rpc(message)
+        } else if message.contains("timed out") {
             Self::Timeout(message)
         } else if message.contains("connect ")
             || message.contains("Connection refused")
@@ -77,6 +111,7 @@ impl CliError {
             Self::Connection(_) => ExitCode::Connection,
             Self::Rpc(_) => ExitCode::Rpc,
             Self::Timeout(_) => ExitCode::Timeout,
+            Self::Recovery { source, .. } => source.exit_code(),
         }
     }
 }
@@ -88,15 +123,41 @@ impl fmt::Display for CliError {
             | Self::Connection(message)
             | Self::Rpc(message)
             | Self::Timeout(message) => f.write_str(message),
+            Self::Recovery { source, .. } => source.fmt(f),
         }
     }
 }
 
-impl std::error::Error for CliError {}
+impl std::error::Error for CliError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Recovery { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_preserves_known_delivery_state_ids_and_exit_code() {
+        let error = CliError::Timeout("wait timed out".into())
+            .with_recovery(serde_json::json!({
+                "clientInputId": "input-1", "deliveryState": "accepted", "stage": "observe",
+            }))
+            .with_recovery(serde_json::json!({
+                "sessionId": "session-1", "deliveryState": "not_submitted", "stage": "configure",
+            }));
+        assert_eq!(error.exit_code(), ExitCode::Timeout);
+        assert_eq!(error.to_string(), "wait timed out");
+        let recovery = error.recovery().unwrap();
+        assert_eq!(recovery["sessionId"], "session-1");
+        assert_eq!(recovery["clientInputId"], "input-1");
+        assert_eq!(recovery["deliveryState"], "accepted");
+        assert_eq!(recovery["stage"], "observe");
+    }
 
     #[test]
     fn notification_errors_preserve_existing_rpc_classification() {

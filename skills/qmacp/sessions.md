@@ -31,7 +31,11 @@ qmacp --quiet find --cwd "$PWD" --resolution resolved --archive only
 
 `new` creates only. Prefer `prompt --new` when the next step is a prompt; see
 [live control](control.md). Keep the returned `sessionId`. If `find` returns
-multiple matches, inspect or ask rather than picking by list order.
+multiple matches, inspect or ask rather than picking by list order. For early
+creation receipts, opt in to `new --stream`; see [CLI output](cli.md#output).
+
+`find` reports `pagesScanned`, `truncated`, `pageCapReached`, and `stopReason`
+(`exhausted|limit|page_cap`). A truncated empty result is not exhaustive.
 
 ## Inspect and configure
 

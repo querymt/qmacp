@@ -1,3 +1,5 @@
+use std::io::{self, Write};
+
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -10,27 +12,26 @@ pub fn write_json(value: &impl Serialize, pretty: bool) -> Result<()> {
     } else {
         serde_json::to_string(value).context("serialize JSON")?
     };
-    println!("{text}");
-    Ok(())
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(text.as_bytes()).context("write JSON")?;
+    stdout.write_all(b"\n").context("write JSON newline")?;
+    stdout.flush().context("flush JSON")
 }
 
 pub fn write_event(value: &impl Serialize) -> Result<()> {
-    println!(
-        "{}",
-        serde_json::to_string(value).context("serialize event")?
-    );
-    Ok(())
+    write_json(value, false)
 }
 
 pub fn write_error(error: &CliError, pretty: bool) -> Result<()> {
-    write_json(
-        &json!({
-            "ok": false,
-            "error": error.to_string(),
-            "code": error.exit_code().as_i32(),
-        }),
-        pretty,
-    )
+    let mut value = json!({
+        "ok": false,
+        "error": error.to_string(),
+        "code": error.exit_code().as_i32(),
+    });
+    if let Some(recovery) = error.recovery() {
+        value["recovery"] = recovery.clone();
+    }
+    write_json(&value, pretty)
 }
 
 pub fn ok(mut value: Value) -> Value {

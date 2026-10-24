@@ -36,17 +36,32 @@ qmacp [--url URL] [--allow-insecure] [--pretty] [--permission allow-once|reject-
 ## Output
 
 - Most commands: one JSON object on stdout (`ok` is set).
-- `prompt`, `follow`, and `exec`: compact NDJSON. `watch` emits `runtime` events,
-  then a final JSON object. Connection logs go to stderr.
-- Success requires exit 0 and JSON `ok` not false. For `prompt`/`follow`, also
-  require a terminal `"type":"done"` event; its `text` is the assembled response.
+- `prompt`, `follow`, `exec`, and opt-in `new --stream`: NDJSON.
+  `watch` emits `runtime` events, then a final JSON object.
+  Connection logs go to stderr.
+- Success requires exit 0 and JSON `ok` not false. `prompt`, `follow`, and
+  `new --stream` also require a terminal `"type":"done"`. `exec` emits individual
+  command results, not a global `done`.
 - Exit codes: 0 success, 1 usage, 2 connection, 3 RPC, 4 timeout/cancel.
 
-Stream event types: `session`, `text`, `tool`, `mode`, `plan`, `input_state`,
-`permission`, `elicitation`, `runtime`, `update`, `done`.
+Stream event types: `session`, `submitted`, `text`, `tool`, `mode`, `plan`,
+`input_state`, `permission`, `elicitation`, `runtime`, `update`, `done`.
 Do not claim a cancel/discard/close/config change succeeded without exit 0 and
 JSON `ok: true`. Inspect current state after uncertain delivery rather than retrying
 blindly; see [live control](control.md).
+
+`new --stream`/`prompt --new` emit `sessionId` before configuration. Default
+`new` still returns one object. Queue/steer prompts emit `submitted` with
+`clientInputId` and `receipt` before waiting; `done` retains them.
+
+On failure, `recovery` preserves known IDs, the failing `stage`
+(`create|configure|submit|observe`), and creation/delivery state. `not_submitted`
+or `rejected` differs from `unknown`; `accepted` means a receipt was received,
+not that the task completed. Inspect state before retrying an uncertain or
+accepted submission. A lost creation response cannot provide a session ID.
+
+`observationState` is `not_waited`, `idle`, or `prompt_returned`, not proof of
+task success. `text` contains only assistant text observed on this connection.
 
 ## Permissions
 
@@ -77,5 +92,6 @@ EOF
 ```
 
 This is not a shell: no escaping, no using an ID returned by an earlier line,
-and no stdin prompts inside a stdin batch. Discover IDs before the batch.
+and no stdin payloads inside a stdin batch (including queue/steer). Such reads
+are rejected before any batch command runs. Discover IDs before the batch.
 See [session management](sessions.md) for lifecycle and capability requirements.
