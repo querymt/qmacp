@@ -89,6 +89,9 @@ pub enum Command {
         model: Option<String>,
         #[arg(long)]
         effort: Option<String>,
+        /// Emit an early creation receipt before configuration (NDJSON).
+        #[arg(long)]
+        stream: bool,
     },
     /// List sessions with ACP pagination and optional lifecycle or pin filters.
     Sessions {
@@ -215,13 +218,15 @@ pub enum Command {
         session_id: String,
         #[arg(long)]
         run_id: Option<String>,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        /// Text to submit; use `-` explicitly to read stdin.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         text: Vec<String>,
     },
     /// Queue input for after the current turn.
     Queue {
         session_id: String,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        /// Text to submit; use `-` explicitly to read stdin.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         text: Vec<String>,
     },
     /// Remove an input that has not started from the session queue.
@@ -238,6 +243,26 @@ pub enum Command {
     Cancel { session_id: String },
     /// Close a materialized session.
     Close { session_id: String },
+}
+
+impl Command {
+    fn reads_stdin(&self) -> bool {
+        let text = match self {
+            Self::Prompt { new, args, .. } => {
+                let start = usize::from(!new);
+                args.get(start..).unwrap_or_default()
+            }
+            Self::Queue { text, .. } | Self::Steer { text, .. } => text.as_slice(),
+            Self::Exec { commands } => {
+                return commands.is_empty()
+                    || commands.iter().any(|line| {
+                        parse_exec_line(line).is_ok_and(|command| command.reads_stdin())
+                    });
+            }
+            _ => return false,
+        };
+        text.is_empty() || (text.len() == 1 && text[0] == "-")
+    }
 }
 
 pub struct CommandOutcome {
@@ -263,9 +288,10 @@ pub async fn run(
             mode,
             model,
             effort,
+            stream,
         } => write_ok(
             pretty,
-            new_session(client, cwd, profile, mode, model, effort).await?,
+            new_session(client, cwd, profile, mode, model, effort, stream).await?,
         ),
         Command::Sessions {
             cwd,
@@ -492,24 +518,45 @@ async fn new_session(
     mode: Option<String>,
     model: Option<String>,
     effort: Option<String>,
+    stream: bool,
 ) -> Result<Value, CliError> {
     client.initialize().await.map_err(CliError::from_request)?;
     let cwd = session::resolve_cwd(cwd).map_err(CliError::rpc)?;
     let (created, created_raw) = client
         .new_session(cwd.clone(), profile.as_deref())
         .await
-        .map_err(CliError::from_request)?;
+        .map_err(|error| request_failure(error, json!({"stage": "create"})))?;
     let session_id = created.session_id.to_string();
-    apply_config(client, &session_id, mode, model, effort).await?;
+    let recovery = json!({
+        "sessionId": session_id,
+        "creationState": "created",
+        "deliveryState": "not_submitted",
+        "stage": "configure",
+    });
+    if stream {
+        output::write_event(&json!({
+            "type": "session", "sessionId": session_id, "cwd": cwd,
+            "creationState": "created",
+        }))
+        .map_err(|error| CliError::rpc(error).with_recovery(recovery.clone()))?;
+    }
+    apply_config(client, &session_id, mode, model, effort)
+        .await
+        .map_err(|error| error.with_recovery(recovery))?;
     let status = match open_session(client, session_id.clone(), cwd.clone()).await {
         Ok(opened) => opened.status,
         Err(_) => session::config_status(&session_id, created.modes.as_ref(), &created_raw),
     };
-    Ok(json!({
+    let mut result = json!({
         "sessionId": session_id,
         "cwd": cwd,
+        "creationState": "created",
         "status": status,
-    }))
+    });
+    if stream {
+        result["type"] = json!("done");
+    }
+    Ok(result)
 }
 
 async fn sessions(
@@ -594,9 +641,8 @@ async fn find(
     client.initialize().await.map_err(CliError::from_request)?;
     let cwd = session::resolve_optional_cwd(cwd).map_err(CliError::rpc)?;
     let query = query.unwrap_or_default();
-    let has_lifecycle_filters = resolution.is_some() || archive.is_some();
     let filters = session_filter_meta(resolution, archive, pinned);
-    if has_lifecycle_filters {
+    if resolution.is_some() || archive.is_some() {
         require_lifecycle_support(client, None).await?;
     }
     if pinned.is_some() {
@@ -606,39 +652,38 @@ async fn find(
     let mut matches = Vec::new();
     let mut next = None;
     let mut pages = 0usize;
-    loop {
-        pages += 1;
-        if pages > session::find_page_cap() {
-            break;
-        }
+    let (truncated, stop_reason) = 'pages: loop {
         let page = client
             .list_sessions(cwd.clone(), next.clone(), filters.clone())
             .await
             .map_err(CliError::from_request)?;
-        for listed in page.sessions {
+        pages += 1;
+        let page_len = page.sessions.len();
+        for (index, listed) in page.sessions.into_iter().enumerate() {
             let summary = session::session_summary(&listed);
             if session::matches_query_and_phase(&summary, &query, phase.as_deref()) {
                 matches.push(summary);
                 if matches.len() >= limit {
-                    return Ok(json!({
-                        "query": query,
-                        "phase": phase,
-                        "cwd": cwd,
-                        "sessions": matches,
-                    }));
+                    let more = index + 1 < page_len || page.next_cursor.is_some();
+                    break 'pages (more, if more { "limit" } else { "exhausted" });
                 }
             }
         }
         match page.next_cursor {
+            Some(_) if pages >= session::find_page_cap() => break (true, "page_cap"),
             Some(cursor) => next = Some(cursor),
-            None => break,
+            None => break (false, "exhausted"),
         }
-    }
+    };
     Ok(json!({
         "query": query,
         "phase": phase,
         "cwd": cwd,
         "sessions": matches,
+        "pagesScanned": pages,
+        "truncated": truncated,
+        "pageCapReached": stop_reason == "page_cap",
+        "stopReason": stop_reason,
     }))
 }
 
@@ -936,74 +981,96 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
         args,
         pretty,
     } = args;
-    let initialized = client.initialize().await.map_err(CliError::from_request)?;
-    let cwd = session::resolve_cwd(cwd).map_err(CliError::rpc)?;
     let (session_id, text) = parse_prompt_args(new, args)?;
     let text = read_prompt_text(text).map_err(CliError::rpc)?;
+    let cwd = session::resolve_cwd(cwd).map_err(CliError::rpc)?;
+    let initialized = client.initialize().await.map_err(CliError::from_request)?;
     let session_id = if new {
         let (created, _) = client
             .new_session(cwd.clone(), profile.as_deref())
             .await
-            .map_err(CliError::from_request)?;
+            .map_err(|error| request_failure(error, json!({"stage": "create"})))?;
         created.session_id.to_string()
     } else {
-        let Some(session_id) = session_id else {
-            return Err(CliError::Usage(
-                "prompt requires SESSION_ID or --new".into(),
-            ));
-        };
-        let _ = open_session(client, session_id.clone(), cwd.clone()).await?;
-        session_id
+        session_id.ok_or_else(|| CliError::Usage("prompt requires SESSION_ID or --new".into()))?
     };
-    apply_config(client, &session_id, mode, model, effort).await?;
+    let mut recovery = json!({
+        "sessionId": session_id,
+        "stage": "configure",
+        "deliveryState": "not_submitted",
+    });
+    if new {
+        recovery["creationState"] = json!("created");
+        output::write_event(&json!({
+            "type": "session", "sessionId": session_id, "cwd": cwd,
+            "creationState": "created",
+        }))
+        .map_err(|error| CliError::rpc(error).with_recovery(recovery.clone()))?;
+    }
     let chosen = if new {
         Delivery::Prompt
     } else {
-        choose_delivery(client, &session_id, delivery).await?
+        choose_delivery(client, &session_id, delivery)
+            .await
+            .map_err(|error| error.with_recovery(recovery.clone()))?
     };
+    // Queue/steer do not need replay or runtime restoration, even when waiting later.
+    if !new && chosen == Delivery::Prompt {
+        open_session(client, session_id.clone(), cwd.clone())
+            .await
+            .map_err(|error| error.with_recovery(recovery.clone()))?;
+    }
+    apply_config(client, &session_id, mode, model, effort)
+        .await
+        .map_err(|error| error.with_recovery(recovery.clone()))?;
+    recovery["delivery"] = json!(delivery_name(chosen));
     output::write_event(&json!({
-        "type": "session",
-        "sessionId": session_id,
-        "cwd": cwd,
+        "type": "session", "sessionId": session_id, "cwd": cwd,
         "delivery": delivery_name(chosen),
     }))
-    .map_err(CliError::rpc)?;
+    .map_err(|error| CliError::rpc(error).with_recovery(recovery.clone()))?;
     let _ = client.take_assistant_text().await;
-
     let timeout = timeout.map(Duration::from_secs);
+    recovery["stage"] = json!("submit");
+    let mut receipt = None;
     let stop_reason = match chosen {
         Delivery::Prompt => {
             let response = client
                 .prompt(session_id.clone(), text, timeout)
                 .await
-                .map_err(CliError::from_request)?;
+                .map_err(|error| request_failure(error, recovery.clone()))?;
             stop_reason_name(&response.stop_reason)
         }
-        Delivery::Steer => {
-            submit_input(
-                client,
-                "querymt/session/steer",
-                session_id.clone(),
-                None,
-                vec![text],
-            )
-            .await?;
-            "steered".to_string()
-        }
-        Delivery::Queue => {
-            submit_input(
-                client,
-                "querymt/session/queue",
-                session_id.clone(),
-                None,
-                vec![text],
-            )
-            .await?;
-            "queued".to_string()
+        Delivery::Steer | Delivery::Queue => {
+            let method = if chosen == Delivery::Steer {
+                "querymt/session/steer"
+            } else {
+                "querymt/session/queue"
+            };
+            let submitted = submit_text(client, method, session_id.clone(), None, text)
+                .await
+                .map_err(|error| error.with_recovery(recovery.clone()))?;
+            recovery["clientInputId"] = submitted["clientInputId"].clone();
+            recovery["receipt"] = submitted.clone();
+            recovery["deliveryState"] = json!("accepted");
+            output::write_event(&json!({
+                "type": "submitted", "ok": true, "sessionId": session_id,
+                "delivery": delivery_name(chosen), "deliveryState": "accepted",
+                "clientInputId": submitted["clientInputId"], "receipt": submitted,
+            }))
+            .map_err(|error| CliError::rpc(error).with_recovery(recovery.clone()))?;
+            receipt = Some(submitted);
+            if chosen == Delivery::Steer {
+                "steered"
+            } else {
+                "queued"
+            }
+            .to_string()
         }
         Delivery::Auto => unreachable!("auto is resolved before send"),
     };
-
+    recovery["deliveryState"] = json!("accepted");
+    recovery["stage"] = json!("observe");
     let mut text = client.take_assistant_text().await;
     if until_idle {
         wait_until_idle(
@@ -1011,40 +1078,26 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
             &session_id,
             timeout.unwrap_or(Duration::from_secs(120)),
         )
-        .await?;
+        .await
+        .map_err(|error| error.with_recovery(recovery.clone()))?;
         let more = client.snapshot_assistant_text().await;
         if !more.is_empty() {
             text = more;
         }
-        if let Ok(inspected) = inspect(
-            client,
-            session_id.clone(),
-            Some(cwd.clone()),
-            false,
-            Some(12),
-            false,
-        )
-        .await
-            && let Some(last) = session::last_assistant_text(&inspected)
-        {
-            text = last;
-        }
     }
-
-    let done = json!({
-        "type": "done",
-        "ok": true,
-        "sessionId": session_id,
-        "delivery": delivery_name(chosen),
-        "stopReason": stop_reason,
-        "text": text,
+    let mut done = json!({
+        "type": "done", "ok": true, "sessionId": session_id,
+        "delivery": delivery_name(chosen), "deliveryState": "accepted",
+        "observationState": if until_idle { "idle" } else if chosen == Delivery::Prompt { "prompt_returned" } else { "not_waited" },
+        "stopReason": stop_reason, "text": text,
         "loadSession": initialized.agent_capabilities.load_session,
     });
-    if pretty {
-        output::write_json(&done, true).map_err(CliError::rpc)?;
-    } else {
-        output::write_event(&done).map_err(CliError::rpc)?;
+    if let Some(receipt) = receipt {
+        done["clientInputId"] = receipt["clientInputId"].clone();
+        done["receipt"] = receipt;
     }
+    output::write_json(&done, pretty)
+        .map_err(|error| CliError::rpc(error).with_recovery(recovery))?;
     Ok(CommandOutcome {
         exit: output::exit_for_stop_reason(&stop_reason),
     })
@@ -1071,11 +1124,16 @@ async fn choose_delivery(
     let phase = state
         .pointer("/runtime/phase")
         .and_then(Value::as_str)
-        .unwrap_or("idle");
+        .filter(|phase| !phase.is_empty())
+        .ok_or_else(|| {
+            CliError::rpc("runtime response has no valid phase; input was not submitted")
+        })?;
     let steerable = state
         .pointer("/runtime/steerable")
         .and_then(Value::as_bool)
-        .unwrap_or(false);
+        .ok_or_else(|| {
+            CliError::rpc("runtime response has no valid steerable flag; input was not submitted")
+        })?;
     Ok(delivery_from_runtime(phase, steerable))
 }
 
@@ -1103,24 +1161,21 @@ async fn wait_until_idle_every(
     timeout: Duration,
     interval: Duration,
 ) -> Result<(), CliError> {
-    let deadline = tokio::time::Instant::now() + timeout.max(Duration::from_secs(1));
-    loop {
-        let value = runtime(client, session_id.to_string()).await?;
-        let phase = value
-            .pointer("/runtime/phase")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        if phase == "idle" {
-            return Ok(());
+    let mut phase = "unknown".to_string();
+    tokio::time::timeout(timeout.max(Duration::from_secs(1)), async {
+        loop {
+            let value = runtime(client, session_id.to_string()).await?;
+            phase = value.pointer("/runtime/phase")
+                .and_then(Value::as_str).unwrap_or("unknown").to_string();
+            if phase == "idle" {
+                return Ok(());
+            }
+            tokio::time::sleep(interval.max(Duration::from_millis(200))).await;
         }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(CliError::Timeout(format!(
-                "timed out after {}s while session {session_id} was {phase}",
-                timeout.as_secs()
-            )));
-        }
-        tokio::time::sleep(interval.max(Duration::from_millis(200))).await;
-    }
+    }).await.map_err(|_| CliError::Timeout(format!(
+        "timed out after {}s waiting for session {session_id} to become idle (last phase: {phase}); remote work was not cancelled",
+        timeout.as_secs(),
+    )))?
 }
 
 async fn follow(
@@ -1216,39 +1271,103 @@ async fn submit_input(
     run_id: Option<String>,
     text: Vec<String>,
 ) -> Result<Value, CliError> {
-    client.initialize().await.map_err(CliError::from_request)?;
-    let text =
-        join_prompt_args(text).ok_or_else(|| CliError::Usage(format!("{method} requires TEXT")))?;
-    let run_id = if method.ends_with("/steer") && run_id.is_none() {
-        runtime(client, session_id.clone())
-            .await?
-            .pointer("/runtime/active_run_id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
+    let text = join_prompt_args(text)
+        .ok_or_else(|| CliError::Usage("text is required (pass TEXT or - for stdin)".into()))?;
+    let text = read_prompt_text(Some(text)).map_err(CliError::rpc)?;
+    submit_text(client, method, session_id, run_id, text).await
+}
+
+async fn submit_text(
+    client: &AcpClient,
+    method: &str,
+    session_id: String,
+    run_id: Option<String>,
+    text: String,
+) -> Result<Value, CliError> {
+    let not_submitted = json!({
+        "sessionId": session_id, "stage": "submit", "deliveryState": "not_submitted",
+    });
+    client
+        .initialize()
+        .await
+        .map_err(|error| CliError::from_request(error).with_recovery(not_submitted.clone()))?;
+    let run_id = if method.ends_with("/steer") {
+        let run_id = match run_id {
+            Some(id) => Some(id),
+            None => runtime(client, session_id.clone())
+                .await
+                .map_err(|error| error.with_recovery(not_submitted.clone()))?
+                .pointer("/runtime/active_run_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        };
+        Some(run_id.filter(|id| !id.trim().is_empty()).ok_or_else(|| {
+            CliError::rpc(
+                "steer requires an active run or a nonempty --run-id; input was not submitted",
+            )
+            .with_recovery(not_submitted.clone())
+        })?)
     } else {
         run_id
     };
     let client_input_id = uuid::Uuid::new_v4().to_string();
+    let mut recovery = json!({
+        "sessionId": session_id, "clientInputId": client_input_id, "stage": "submit",
+    });
     let mut params = json!({
         "session_id": session_id,
         "client_input_id": client_input_id,
         "prompt": [{ "type": "text", "text": text }],
     });
     if let Some(run_id) = run_id {
-        params
-            .as_object_mut()
-            .expect("params object")
-            .insert("expected_run_id".to_string(), json!(run_id));
+        params["expected_run_id"] = json!(run_id);
     }
     let response = client
         .extension(method, params)
         .await
-        .map_err(CliError::from_request)?;
+        .map_err(|error| request_failure(error, recovery.clone()))?;
+    let result = extension_payload(&response);
+    let input_id = result.get("input_id").and_then(Value::as_str);
+    let status_valid = response
+        .get("status")
+        .is_none_or(|status| matches!(status.as_str(), Some("queued" | "started" | "steered")));
+    // A JSON-RPC result alone is not a correlated acceptance receipt.
+    if input_id != Some(client_input_id.as_str())
+        || !status_valid
+        || response.get("ok") == Some(&Value::Bool(false))
+        || result.get("ok") == Some(&Value::Bool(false))
+    {
+        recovery["deliveryState"] = json!("unknown");
+        recovery["response"] = response;
+        return Err(CliError::rpc(
+            "invalid submission receipt; acceptance is unknown; inspect before retrying",
+        )
+        .with_recovery(recovery));
+    }
     Ok(json!({
         "sessionId": session_id,
         "clientInputId": client_input_id,
-        "result": extension_payload(&response),
+        "deliveryState": "accepted",
+        "result": result,
     }))
+}
+
+fn request_failure(error: anyhow::Error, mut recovery: Value) -> CliError {
+    let state = if error
+        .downcast_ref::<qmacp::client::RpcResponseError>()
+        .is_some_and(qmacp::client::RpcResponseError::is_rejection)
+    {
+        "rejected"
+    } else {
+        "unknown"
+    };
+    let field = if recovery["stage"] == "create" {
+        "creationState"
+    } else {
+        "deliveryState"
+    };
+    recovery[field] = json!(state);
+    CliError::from_request(error).with_recovery(recovery)
 }
 
 async fn exec(
@@ -1256,7 +1375,8 @@ async fn exec(
     commands: Vec<String>,
     pretty: bool,
 ) -> Result<CommandOutcome, CliError> {
-    let lines = if commands.is_empty() {
+    let from_stdin = commands.is_empty();
+    let lines = if from_stdin {
         let mut buf = String::new();
         io::stdin()
             .read_to_string(&mut buf)
@@ -1274,9 +1394,17 @@ async fn exec(
             "exec requires commands on stdin or as arguments".into(),
         ));
     }
+    let commands = lines
+        .iter()
+        .map(|line| parse_exec_line(line))
+        .collect::<Result<Vec<_>, _>>()?;
+    if from_stdin && commands.iter().any(Command::reads_stdin) {
+        return Err(CliError::Usage(
+            "stdin payloads cannot be read inside a stdin exec batch".into(),
+        ));
+    }
     let mut last = CommandOutcome { exit: ExitCode::Ok };
-    for line in lines {
-        let command = parse_exec_line(&line)?;
+    for command in commands {
         last = Box::pin(run(client, command, pretty)).await?;
         if last.exit != ExitCode::Ok {
             return Ok(last);
@@ -1461,22 +1589,22 @@ fn extension_payload(response: &Value) -> Value {
 }
 
 fn read_prompt_text(text: Option<String>) -> Result<String> {
-    match text {
-        Some(text) if text == "-" => {
-            let mut buf = String::new();
-            io::stdin().read_to_string(&mut buf).context("read stdin")?;
-            Ok(buf)
-        }
-        Some(text) => Ok(text),
-        None => {
-            if atty_stdin() {
+    let explicit_stdin = text.as_deref() == Some("-");
+    let text = match text {
+        Some(text) if text != "-" => text,
+        _ => {
+            if !explicit_stdin && atty_stdin() {
                 bail!("prompt text is required (pass TEXT or - for stdin)");
             }
             let mut buf = String::new();
             io::stdin().read_to_string(&mut buf).context("read stdin")?;
-            Ok(buf)
+            buf
         }
+    };
+    if text.trim().is_empty() {
+        bail!("prompt text must not be empty");
     }
+    Ok(text)
 }
 
 fn atty_stdin() -> bool {

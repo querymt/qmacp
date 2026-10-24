@@ -23,7 +23,35 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_PROMPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
-type RpcResult = Result<Value, String>;
+/// A JSON-RPC error returned by the server, distinct from a lost connection.
+#[derive(Debug)]
+pub struct RpcResponseError(Value);
+
+impl RpcResponseError {
+    /// Whether the protocol error establishes that the request was rejected.
+    pub fn is_rejection(&self) -> bool {
+        matches!(
+            self.0.get("code").and_then(Value::as_i64),
+            Some(-32700 | -32600 | -32601 | -32602)
+        )
+    }
+}
+
+impl std::fmt::Display for RpcResponseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for RpcResponseError {}
+
+#[derive(Debug)]
+enum RpcFailure {
+    Response(Value),
+    Transport(String),
+}
+
+type RpcResult = Result<Value, RpcFailure>;
 type PendingRequests = Arc<Mutex<HashMap<i64, oneshot::Sender<RpcResult>>>>;
 type Outbound = (Message, Option<oneshot::Sender<Result<(), String>>>);
 
@@ -440,7 +468,10 @@ impl AcpClient {
             bail!("WebSocket writer is closed");
         }
         match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(result)) => result.map_err(anyhow::Error::msg),
+            Ok(Ok(result)) => result.map_err(|error| match error {
+                RpcFailure::Response(value) => anyhow::Error::new(RpcResponseError(value)),
+                RpcFailure::Transport(message) => anyhow::Error::msg(message),
+            }),
             Ok(Err(_)) => bail!("request {method} was dropped"),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
@@ -505,7 +536,7 @@ fn build_list_sessions_request(
 async fn fail_pending(pending: &PendingRequests, message: impl Into<String>) {
     let message = message.into();
     for (_, waiter) in pending.lock().await.drain() {
-        let _ = waiter.send(Err(message.clone()));
+        let _ = waiter.send(Err(RpcFailure::Transport(message.clone())));
     }
 }
 
@@ -523,7 +554,7 @@ async fn handle_inbound(
             return Ok(());
         };
         let result = if let Some(error) = value.get("error") {
-            Err(error.to_string())
+            Err(RpcFailure::Response(error.clone()))
         } else {
             Ok(value.get("result").cloned().unwrap_or(Value::Null))
         };

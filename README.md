@@ -59,7 +59,14 @@ Work: `prompt`, `follow`, `watch`, `steer`, `queue`, `discard-queued`, `exec`, `
 
 `prompt --new TEXT` creates a session. `prompt SESSION_ID TEXT` continues one. `-` reads the prompt from stdin. `--delivery auto` prompts when idle, steers when the turn is steerable, otherwise queues. It waits until idle, including queued turns.
 
+`queue SESSION_ID -` and `steer SESSION_ID -` read stdin and return a submission
+receipt without loading history. `prompt --delivery queue|steer --until-idle false`
+also returns after submission; idle/direct prompt delivery still waits for its turn.
+
 `discard-queued` takes the `inputId` from an `input_state` event. That is the same value as `clientInputId` from the submit response.
+
+`find` reports `pagesScanned`, `truncated`, `pageCapReached`, and `stopReason`
+so callers can distinguish a complete search from a result/page limit.
 
 Lifecycle updates are explicit desired states, not toggles. At least one field is required; omitted fields remain unchanged. `caps` reports lifecycle feature/method support, and lifecycle commands/filters fail explicitly when the server does not advertise support. Session summaries preserve available lifecycle data in `_meta.querymt.lifecycle` and pin data in `_meta.querymt.pin`, omitting each when unavailable. Pin commands and filters fail explicitly when the server does not advertise pin support.
 
@@ -89,13 +96,21 @@ EOF
 
 ## Output
 
-Most commands print one JSON object. `prompt`, `follow`, and `exec` stream compact NDJSON. `watch` also emits `runtime` events.
+Most commands, including `new`, print one JSON object. `prompt`, `follow`, and
+`exec` stream NDJSON. Opt in to `new --stream` for an early creation receipt and
+a final `type: done` result. `watch` also emits `runtime` events.
 
-Success is exit 0 and `ok` not false. Streamed commands also need a `"type":"done"` event. `done.text` is the assembled assistant response.
+Success is exit 0 and `ok` not false. `prompt`, `follow`, and `new --stream`
+also need a terminal `"type":"done"` event. `exec` returns its individual command
+results, not a global `done` event.
 
 Exit codes: 0 ok, 1 usage, 2 connection, 3 RPC, 4 timeout or cancel.
 
-Event types: `session`, `text`, `tool`, `mode`, `plan`, `input_state`, `permission`, `elicitation`, `runtime`, `update`, `done`.
+Event types: `session`, `submitted`, `text`, `tool`, `mode`, `plan`, `input_state`, `permission`, `elicitation`, `runtime`, `update`, `done`.
+
+Submission receipts retain `clientInputId`; partial-failure errors include known
+IDs and delivery state in `recovery`. Acceptance is not task completion. See
+[CLI output and recovery](skills/qmacp/cli.md#output) for details.
 
 Elicitation is cancelled and emitted as an event.
 

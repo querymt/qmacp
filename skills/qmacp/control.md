@@ -15,20 +15,25 @@ qmacp --quiet prompt --cwd "$PWD" --delivery queue --until-idle false "$SESSION_
 qmacp --quiet --permission allow-once prompt --new --cwd "$PWD" --timeout 900 - < instructions.txt
 ```
 
-Discover profile/model values rather than copying placeholders. Long prompts:
-stdin (`-`), not nested quoting. Make prompts self-contained; elicitation is
-always cancelled. Existing sessions accept `--delivery auto|prompt|steer|queue`:
+Discover profile/model values rather than copying placeholders. Use stdin (`-`)
+for long payloads; queue/steer require text or an explicit `-`. Make prompts
+self-contained; elicitation is always cancelled. Existing sessions accept
+`--delivery auto|prompt|steer|queue`:
 
 - `auto` (default): idle -> prompt, busy and steerable -> steer, otherwise queue.
 - `prompt`: send a prompt directly; do not use to bypass a busy session's state.
 - `steer`: adjust active work. Direct `steer --run-id` can target an exact run.
-- `queue`: submit input for after the current turn. Do not assume queue-only
-  delivery wakes an idle session; use `auto` when it must resume idle work.
+- `queue`: submit input for after the current turn. Whether it starts an idle
+  session depends on server support; use `auto` when that support is unknown.
 
 `--until-idle` defaults true and waits through queued turns. Pass `--timeout`
 explicitly for predictable bounds. `--until-idle false` skips waiting for idle
 following steer/queue; it is not fire-and-forget when idle delivery uses the
 prompt RPC, which still waits for that turn.
+
+Queue/steer delivery skips history loading. Direct commands return a receipt;
+`prompt --until-idle false` returns after submission when either is selected.
+See [CLI output](cli.md#output) for receipt and observation fields.
 
 ## Observe and control
 
@@ -38,6 +43,7 @@ qmacp --quiet follow "$SESSION_ID" --timeout 900 --interval 1
 qmacp --quiet watch "$SESSION_ID" --timeout 900 --interval 1 --idle true
 qmacp --quiet steer "$SESSION_ID" --run-id "$RUN_ID" 'adjust the active work'
 qmacp --quiet queue "$SESSION_ID" 'do this after the current turn'
+qmacp --quiet queue "$CALLBACK_SESSION_ID" - < callback.txt
 qmacp --quiet discard-queued "$SESSION_ID" "$INPUT_ID"
 qmacp --quiet cancel "$SESSION_ID"
 qmacp --quiet close "$SESSION_ID"
@@ -47,7 +53,8 @@ qmacp --quiet close "$SESSION_ID"
   process; run it from the session workspace.
 - `watch` polls `runtime` (`"type":"runtime"`) until idle unless `--idle false`.
   Default `follow`/`watch` timeout is 120s.
-- `steer --run-id` is optional; if omitted, qmacp uses `runtime.active_run_id`.
+- `steer --run-id` is optional; if omitted, qmacp pins `runtime.active_run_id`.
+  Missing/empty run IDs fail before submission rather than steering unguarded.
 - Queued submit returns `clientInputId`. `input_state` events expose the same ID
   as `inputId`; pass that exact value to `discard-queued`.
 - Do not close a session unless the user asked to end it or a qmtcode test
