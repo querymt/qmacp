@@ -100,10 +100,6 @@ Most commands, including `new`, print one JSON object. `prompt`, `follow`, and
 `exec` stream NDJSON. Opt in to `new --stream` for an early creation receipt and
 a final `type: done` result. `watch` also emits `runtime` events.
 
-Success is exit 0 and `ok` not false. `prompt`, `follow`, and `new --stream`
-also need a terminal `"type":"done"` event. `exec` returns its individual command
-results, not a global `done` event.
-
 Exit codes: 0 ok, 1 usage, 2 connection, 3 RPC, 4 timeout or cancel.
 
 Event types: `session`, `submitted`, `text`, `tool`, `mode`, `plan`, `input_state`, `permission`, `elicitation`, `runtime`, `update`, `done`.

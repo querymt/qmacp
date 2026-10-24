@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1 as acp;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Map, Value, json};
 
@@ -426,13 +426,13 @@ pub async fn run(
             session_id,
             run_id,
             text,
-        } => write_ok(
-            pretty,
+        } => write_submission_ok(
             submit_input(client, "querymt/session/steer", session_id, run_id, text).await?,
+            |value| output::write_json(value, pretty),
         ),
-        Command::Queue { session_id, text } => write_ok(
-            pretty,
+        Command::Queue { session_id, text } => write_submission_ok(
             submit_input(client, "querymt/session/queue", session_id, None, text).await?,
+            |value| output::write_json(value, pretty),
         ),
         Command::DiscardQueued {
             session_id,
@@ -446,6 +446,21 @@ pub async fn run(
 
 fn write_ok(pretty: bool, value: Value) -> Result<CommandOutcome, CliError> {
     output::write_json(&output::ok(value), pretty).map_err(CliError::rpc)?;
+    Ok(CommandOutcome { exit: ExitCode::Ok })
+}
+
+fn write_submission_ok(
+    value: Value,
+    write: impl FnOnce(&Value) -> Result<()>,
+) -> Result<CommandOutcome, CliError> {
+    let recovery = json!({
+        "sessionId": value["sessionId"],
+        "clientInputId": value["clientInputId"],
+        "deliveryState": "accepted",
+        "stage": "submit",
+        "receipt": value,
+    });
+    write(&output::ok(value)).map_err(|error| CliError::rpc(error).with_recovery(recovery))?;
     Ok(CommandOutcome { exit: ExitCode::Ok })
 }
 
@@ -982,7 +997,7 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
         pretty,
     } = args;
     let (session_id, text) = parse_prompt_args(new, args)?;
-    let text = read_prompt_text(text).map_err(CliError::rpc)?;
+    let text = read_prompt_text(text)?;
     let cwd = session::resolve_cwd(cwd).map_err(CliError::rpc)?;
     let initialized = client.initialize().await.map_err(CliError::from_request)?;
     let session_id = if new {
@@ -1273,7 +1288,7 @@ async fn submit_input(
 ) -> Result<Value, CliError> {
     let text = join_prompt_args(text)
         .ok_or_else(|| CliError::Usage("text is required (pass TEXT or - for stdin)".into()))?;
-    let text = read_prompt_text(Some(text)).map_err(CliError::rpc)?;
+    let text = read_prompt_text(Some(text))?;
     submit_text(client, method, session_id, run_id, text).await
 }
 
@@ -1328,9 +1343,10 @@ async fn submit_text(
         .map_err(|error| request_failure(error, recovery.clone()))?;
     let result = extension_payload(&response);
     let input_id = result.get("input_id").and_then(Value::as_str);
-    let status_valid = response
-        .get("status")
-        .is_none_or(|status| matches!(status.as_str(), Some("queued" | "started" | "steered")));
+    let status_valid = matches!(
+        response.get("status").and_then(Value::as_str),
+        Some("queued" | "started" | "steered")
+    );
     // A JSON-RPC result alone is not a correlated acceptance receipt.
     if input_id != Some(client_input_id.as_str())
         || !status_valid
@@ -1588,21 +1604,26 @@ fn extension_payload(response: &Value) -> Value {
         .unwrap_or_else(|| response.clone())
 }
 
-fn read_prompt_text(text: Option<String>) -> Result<String> {
+fn read_prompt_text(text: Option<String>) -> Result<String, CliError> {
     let explicit_stdin = text.as_deref() == Some("-");
     let text = match text {
         Some(text) if text != "-" => text,
         _ => {
             if !explicit_stdin && atty_stdin() {
-                bail!("prompt text is required (pass TEXT or - for stdin)");
+                return Err(CliError::Usage(
+                    "prompt text is required (pass TEXT or - for stdin)".into(),
+                ));
             }
             let mut buf = String::new();
-            io::stdin().read_to_string(&mut buf).context("read stdin")?;
+            io::stdin()
+                .read_to_string(&mut buf)
+                .context("read stdin")
+                .map_err(CliError::rpc)?;
             buf
         }
     };
     if text.trim().is_empty() {
-        bail!("prompt text must not be empty");
+        return Err(CliError::Usage("prompt text must not be empty".into()));
     }
     Ok(text)
 }
@@ -1772,6 +1793,27 @@ mod tests {
             parse_prompt_args(false, vec!["sess-1".into(), "continue".into()]).unwrap();
         assert_eq!(session_id.as_deref(), Some("sess-1"));
         assert_eq!(text.as_deref(), Some("continue"));
+    }
+
+    #[test]
+    fn submission_output_failure_preserves_the_accepted_receipt() {
+        let receipt = json!({
+            "sessionId": "session-1", "clientInputId": "input-1",
+            "deliveryState": "accepted", "result": {"input_id": "input-1"},
+        });
+        let error = write_submission_ok(receipt.clone(), |value| {
+            assert_eq!(value, &output::ok(receipt.clone()));
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed output").into())
+        })
+        .err()
+        .expect("output failure must remain an error");
+        assert_eq!(error.exit_code(), ExitCode::Rpc);
+        let recovery = error.recovery().unwrap();
+        assert_eq!(recovery["sessionId"], "session-1");
+        assert_eq!(recovery["clientInputId"], "input-1");
+        assert_eq!(recovery["deliveryState"], "accepted");
+        assert_eq!(recovery["stage"], "submit");
+        assert_eq!(recovery["receipt"], receipt);
     }
 
     #[test]

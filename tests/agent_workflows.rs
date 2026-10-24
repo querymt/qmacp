@@ -344,15 +344,22 @@ async fn stdin_exec_batches_reject_payload_reads_before_any_earlier_write() {
 }
 
 #[tokio::test]
-async fn empty_stdin_payload_is_not_submitted() {
-    let server = MockServer::start(unexpected).await;
-    let output = invoke(
-        cli().args(["--url", &server.url, "--quiet", "queue", "session-1", "-"]),
-        Some(" \n"),
-    )
-    .await;
-    assert!(!output.status.success());
-    assert!(server.finish().await.is_empty());
+async fn blank_payloads_are_usage_errors_without_submission() {
+    for (args, input) in [
+        (vec!["queue", "session-1", "-"], Some(" \n")),
+        (vec!["prompt", "session-1", " \n"], None),
+    ] {
+        let server = MockServer::start(unexpected).await;
+        let output = invoke(
+            cli().args(["--url", &server.url, "--quiet"]).args(args),
+            input,
+        )
+        .await;
+        assert_eq!(output.status.code(), Some(1));
+        let error = events(&output).pop().unwrap();
+        assert_eq!(error["code"], 1);
+        assert!(server.finish().await.is_empty());
+    }
 }
 
 fn listed(id: &str) -> Value {
@@ -608,13 +615,14 @@ async fn steer_without_an_active_run_does_not_submit() {
 
 #[tokio::test]
 async fn malformed_mismatched_or_failed_receipts_are_not_acceptance() {
-    for variant in 0..3 {
+    for variant in 0..4 {
         let server = MockServer::start(move |request| {
             assert_eq!(request["method"], "_querymt/session/queue");
             Reply::Result(match variant {
                 0 => Value::Null,
                 1 => json!({"status": "queued", "data": {"input_id": "another-input"}}),
-                _ => json!({"status": "failed", "data": {"input_id": request["params"]["client_input_id"]}}),
+                2 => json!({"status": "failed", "data": {"input_id": request["params"]["client_input_id"]}}),
+                _ => json!({"data": {"input_id": request["params"]["client_input_id"]}}),
             })
         }).await;
         let output = invoke(
