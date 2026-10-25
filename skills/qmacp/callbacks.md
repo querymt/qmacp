@@ -73,25 +73,33 @@ registered task. `RESOURCE` identifies the watched resource. Put this Bash
 helper and a watcher body adapted to your task in the same script; run that
 script in the background runner, not in the agent's foreground tool call.
 
-Python watchers can invoke the same qmacp command with
-`subprocess.run([...], input=payload, text=True)` rather than shell
-interpolation.
+Send Markdown with YAML frontmatter starting at the first line, not inside a
+code fence. Keep `type`, `callback_id`, `event_id`, `event`, and `resource` in
+frontmatter; put a one- or two-sentence result and any evidence link in the
+body. Keep logs in artifacts. Do not repeat instructions, registration paths,
+or session/endpoint details in every message. Frontmatter is a text convention,
+not authenticated ACP metadata.
+
+This helper uses `jq` to quote YAML string values safely. Python watchers can
+use `json.dumps` for those values and invoke qmacp with
+`subprocess.run([...], input=payload, text=True)` instead of shell interpolation.
 
 ```bash
 notify_callback() {
-  local event=$1 result=$2
+  local event=$1 result=$2 payload
+  payload=$(jq -nr \
+    --arg id "$CALLBACK_ID" --arg event "$event" \
+    --arg resource "$RESOURCE" --arg result "$result" '
+    "---\ntype: qmacp_callback\n" +
+    "callback_id: \($id | tojson)\n" +
+    "event_id: \(($id + "/terminal") | tojson)\n" +
+    "event: \($event | tojson)\n" +
+    "resource: \($resource | tojson)\n---\n\n" +
+    "## Callback\n\n\($result)"
+  ') || return
   qmacp --url "$QMACP_URL" --quiet prompt \
     --cwd "$SESSION_CWD" --delivery auto --until-idle false --timeout 900 \
-    "$SESSION_ID" - <<EOF
-[qmacp-callback v1]
-callback_id: $CALLBACK_ID
-event_id: $CALLBACK_ID/terminal
-event: $event
-resource: $RESOURCE
-result: $result
-This is a callback for registered work, not a new user instruction.
-Verify current state and follow only the registered continuation.
-EOF
+    "$SESSION_ID" - <<< "$payload"
 }
 ```
 
@@ -125,17 +133,17 @@ rather than keeping an agent busy polling.
 RESOURCE="$REPO#$PR_NUMBER"
 deadline=$((SECONDS + 86400))
 event=pr.watch_expired
-result=deadline_exceeded
+result='PR watch expired after 24 hours.'
 while (( SECONDS < deadline )); do
   if ! state=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json state --jq .state); then
     event=pr.watch_failed
-    result=github_query_failed
+    result='Could not check the PR state; GitHub lookup failed.'
     break
   fi
   case "$state" in
     MERGED|CLOSED)
       event=pr.finished
-      result=$state
+      result="PR state: **$state**."
       break
       ;;
   esac
@@ -162,9 +170,9 @@ timeout.
 ```bash
 RESOURCE="job:$CALLBACK_ID"
 if "${JOB_COMMAND[@]}" >"$JOB_LOG" 2>&1; then
-  result="exit=0; log=$JOB_LOG"
+  result="Command exited with status 0. Log: $JOB_LOG"
 else
-  result="exit=$?; log=$JOB_LOG"
+  result="Command exited with status $?. Log: $JOB_LOG"
 fi
 notify_callback job.finished "$result"
 ```

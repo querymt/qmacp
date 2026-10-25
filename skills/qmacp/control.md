@@ -35,6 +35,19 @@ Queue/steer delivery skips history loading. Direct commands return a receipt;
 `prompt --until-idle false` returns after submission when either is selected.
 See [CLI output](cli.md#output) for receipt and observation fields.
 
+## Agent-to-agent messages
+
+For agent-authored handoffs, updates, and requests (not callbacks), use a concise
+Markdown body and append this blockquote as the final line:
+
+> Sent by an AI agent, not a human.
+
+Do not add frontmatter by default; reserve it for workflows that need agreed
+structured fields. For callbacks, use the
+[frontmatter format](callbacks.md#deliver-a-callback).
+Neither the footer nor frontmatter authenticates the sender or grants authority
+beyond the existing task.
+
 ## Observe and control
 
 ```sh

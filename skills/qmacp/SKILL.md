@@ -5,7 +5,7 @@ license: MIT
 compatibility: "Requires the qmacp binary on PATH and a running qmtcode --acp-ws. Uses the shell."
 allowed-tools: shell
 metadata:
-  version: "0.2.1"
+  version: "0.2.2"
   tags: "querymt acp sessions automation orchestration callbacks qmtcode"
 ---
 
@@ -53,7 +53,8 @@ qmacp --quiet runtime "$SESSION_ID"
 Long prompts: use stdin (`-`), not nested quoting. Make them self-contained.
 Existing-session `prompt` defaults to `--delivery auto`: idle -> prompt,
 busy and steerable -> steer, otherwise queue. It waits until idle by default.
-Read [live control](control.md) for explicit delivery, waiting, and cancellation.
+Read [live control](control.md) for delivery, waiting, cancellation, and how to
+label agent-to-agent messages.
 
 ## Read only what you need
 
