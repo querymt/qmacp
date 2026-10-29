@@ -27,7 +27,11 @@ requirements; do not alter unrelated sessions or user-run services.
 - Load/list features: if `caps.acp.loadSession`/`list`/`close` are false, do not keep
   calling `inspect`/`sessions`/`close`.
 
-Query `runtime` or `status` again rather than treating earlier output as current.
-Do not claim cancel/discard/close/config success without exit 0 and JSON `ok: true`.
+Query `runtime` again for execution state rather than treating earlier output as
+current; `status` is configuration only. Auto delivery and waits require updated
+backend observation metadata. Unknown/unavailable is not idle or task success.
+Require exit 0 and JSON `ok: true` for command success. Cancel's
+`cancellationState: "notification_sent"` proves only notification write/flush;
+check runtime/outcome evidence separately for termination.
 Prompt/follow checks also require a terminal `"type":"done"`, but a receipt or idle
 state alone is not semantic proof of the task result. Inspect the relevant result.

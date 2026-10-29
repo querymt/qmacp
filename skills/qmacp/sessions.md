@@ -36,6 +36,10 @@ creation receipts, opt in to `new --stream`; see [CLI output](cli.md#output).
 
 `find` reports `pagesScanned`, `truncated`, `pageCapReached`, and `stopReason`
 (`exhausted|limit|page_cap`). A truncated empty result is not exhaustive.
+Summaries retain full backend `runtime` observation/activity metadata. Missing
+phase stays null; unknown/unavailable or unobserved status never becomes idle.
+`find --phase idle` matches only usable self-idle observations, even when managed
+dependency activity remains live. It does not test task or descendant completion.
 
 ## Inspect and configure
 
@@ -52,7 +56,12 @@ qmacp --quiet set-effort "$SESSION_ID" high    # auto|low|medium|high|max
 ```
 
 `status` is mode/model/profile/effort; `runtime` is phase/queue/steerability.
-`inspect --tools` defaults true; use `--tools false` for compact history.
+Compact `inspect` includes `delegations` from snapshot `delegationUpdates`, separate
+from dispatch `tools`, using the same records as live `delegation` events.
+`inspect --tools` defaults true; `--tools false` hides only tools, not delegations.
+Snapshot records are point observations; a later live record with the same
+`sourceEpoch` and higher `sessionSeq` is newer. Historical nonterminal rows do not
+prove live activity, and a terminal workflow record does not prove OS process exit.
 `--full` dumps the raw snapshot (large). Do not treat earlier output as current
 state; query again before acting. Require exit 0 and JSON `ok: true` for changes.
 
