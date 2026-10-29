@@ -212,6 +212,14 @@ async fn nonwaiting_prompts_emit_receipts_without_resume_load_or_prompt_rpcs() {
         let done = events.last().unwrap();
         assert_eq!(done["type"], "done");
         assert_eq!(done["observationState"], "not_waited");
+        assert_eq!(
+            done["stopReason"],
+            if method == "steer" {
+                "steered"
+            } else {
+                "queued"
+            }
+        );
         assert_eq!(receipt["clientInputId"], done["clientInputId"]);
         let requests = server.finish().await;
         assert_eq!(requests.last().unwrap()["params"]["prompt"][0]["text"], "-");
@@ -1063,6 +1071,70 @@ async fn accepted_prompt_observation_disconnect_preserves_receipt_without_replay
 }
 
 #[tokio::test]
+async fn accepted_queue_and_steer_recovery_does_not_claim_prompt_outcome() {
+    for delivery in ["queue", "steer"] {
+        let mut submitted = false;
+        let server = MockServer::start(move |request| match request["method"].as_str().unwrap() {
+            "_querymt/session/queue" | "_querymt/session/steer" => {
+                submitted = true;
+                accepted(request)
+            }
+            "_querymt/session/runtimeState" if !submitted => runtime("tools", true),
+            "_querymt/session/runtimeState" => Reply::Result(json!({
+                "phase": "unknown", "observation": {"availability": "unavailable", "reason": "owner_unavailable"},
+            })),
+            _ => unexpected(request),
+        }).await;
+        let output = invoke(
+            cli().args([
+                "--url",
+                &server.url,
+                "--quiet",
+                "prompt",
+                "--delivery",
+                delivery,
+                "--timeout",
+                "1",
+                "target",
+                "work",
+            ]),
+            None,
+        )
+        .await;
+        assert_eq!(output.status.code(), Some(3), "{output:?}");
+        let events = events(&output);
+        let submitted = events
+            .iter()
+            .find(|event| event["type"] == "submitted")
+            .unwrap();
+        let recovery = &events.last().unwrap()["recovery"];
+        assert_eq!(recovery["sessionId"], "target");
+        assert_eq!(recovery["stage"], "observe");
+        assert_eq!(recovery["delivery"], delivery);
+        assert_eq!(recovery["deliveryState"], "accepted");
+        assert_eq!(recovery["clientInputId"], submitted["clientInputId"]);
+        assert_eq!(recovery["receipt"], submitted["receipt"]);
+        assert_eq!(recovery["observationState"], "unavailable");
+        assert_eq!(
+            recovery["runtime"]["observation"]["reason"],
+            "owner_unavailable"
+        );
+        assert!(events.iter().all(|event| event["type"] != "done"));
+        assert!(
+            recovery.get("stopReason").is_none(),
+            "{delivery}: {recovery}"
+        );
+        let requests = server.finish().await;
+        assert!(
+            requests
+                .iter()
+                .all(|request| request["method"] != "session/prompt")
+        );
+        assert_eq!(requests.len(), if delivery == "steer" { 4 } else { 3 });
+    }
+}
+
+#[tokio::test]
 async fn returned_prompt_keeps_its_stop_reason_when_later_observation_fails() {
     let server = MockServer::start(|request| match request["method"].as_str().unwrap() {
         "session/new" => Reply::Result(json!({"sessionId": "created-session"})),
@@ -1092,6 +1164,10 @@ async fn returned_prompt_keeps_its_stop_reason_when_later_observation_fails() {
 
 #[tokio::test]
 async fn discovery_preserves_unknown_observations_and_filters_only_known_phases() {
+    let remote_runtime = json!({
+        "phase": "tools", "active_run_id": "remote-run",
+        "observation": {"availability": "live", "epoch": "remote-actor", "revision": 9},
+    });
     let listed = vec![
         json!({"sessionId": "missing", "cwd": "/tmp"}),
         json!({"sessionId": "offline", "cwd": "/tmp", "_meta": {"runtimeStatus": {
@@ -1105,8 +1181,10 @@ async fn discovery_preserves_unknown_observations_and_filters_only_known_phases(
         json!({"sessionId": "busy", "cwd": "/tmp", "_meta": {"runtimeStatus": {
             "phase": "tools", "active_run_id": "run-B", "observation": {"availability": "live", "epoch": "actor-1", "revision": 8},
         }}}),
+        json!({"sessionId": "null-phase", "cwd": "/tmp", "_meta": {"runtimeStatus": {"phase": null}}}),
+        json!({"sessionId": "remote-busy", "cwd": "/tmp", "_meta": {"runtimeStatus": remote_runtime}}),
     ];
-    for phase in [None, Some("idle"), Some("unknown")] {
+    for phase in [None, Some("idle"), Some("unknown"), Some("tools")] {
         let listed = listed.clone();
         let server = MockServer::start(move |request| {
             assert_eq!(request["method"], "session/list");
@@ -1131,6 +1209,7 @@ async fn discovery_preserves_unknown_observations_and_filters_only_known_phases(
         match phase {
             Some("idle") => assert_eq!(ids, ["parent"]),
             Some("unknown") => assert_eq!(ids, ["offline", "unobserved"]),
+            Some("tools") => assert_eq!(ids, ["busy", "remote-busy"]),
             None => {
                 assert!(sessions[0]["phase"].is_null());
                 assert_eq!(
@@ -1143,6 +1222,11 @@ async fn discovery_preserves_unknown_observations_and_filters_only_known_phases(
                 );
                 assert_eq!(sessions[4]["runtime"]["active_run_id"], "run-B");
                 assert_eq!(sessions[4]["runtime"]["observation"]["revision"], 8);
+                assert!(sessions[5]["phase"].is_null());
+                assert_eq!(sessions[5]["runtime"], json!({"phase": null}));
+                assert_eq!(sessions[6]["phase"], "tools");
+                assert!(sessions[6]["messageCount"].is_null());
+                assert_eq!(sessions[6]["runtime"], remote_runtime);
             }
             _ => unreachable!(),
         }

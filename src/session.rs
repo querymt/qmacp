@@ -69,12 +69,16 @@ pub fn compact_session_summary(session: &acp::SessionInfo) -> Value {
         .and_then(|meta| serde_json::to_value(meta).ok())
         .unwrap_or(Value::Null);
     let runtime = meta.get("runtimeStatus").cloned().unwrap_or(Value::Null);
+    let phase = runtime
+        .get("phase")
+        .filter(|phase| !phase.is_null())
+        .map(|_| observed_phase(&runtime).unwrap_or("unknown"));
     let mut summary = json!({
         "sessionId": session.session_id.to_string(),
         "cwd": path_string(&session.cwd),
         "title": session.title,
         "updatedAt": session.updated_at,
-        "phase": runtime.get("phase").map(|_| observed_phase(&runtime).unwrap_or("unknown")),
+        "phase": phase,
         "messageCount": meta.get("messageCount").cloned(),
         "runtime": runtime,
     });

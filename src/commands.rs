@@ -1086,7 +1086,9 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
     };
     recovery["deliveryState"] = json!("accepted");
     recovery["stage"] = json!("observe");
-    recovery["stopReason"] = json!(stop_reason);
+    if chosen == Delivery::Prompt {
+        recovery["stopReason"] = json!(stop_reason);
+    }
     let mut text = client.take_assistant_text().await;
     let observed = if until_idle {
         let observed = wait_until_idle(
