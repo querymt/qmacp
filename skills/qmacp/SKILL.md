@@ -28,7 +28,9 @@ keep the returned `sessionId`. Default endpoint: `ws://127.0.0.1:3030/acp/ws`.
   `--permission cancel` to fail closed. Elicitation is always cancelled.
 - JSON/NDJSON goes to stdout; connection logs go to stderr. Require exit 0 and
   JSON `ok` not false; `prompt`/`follow` also need a terminal `"type":"done"`.
-  Do not use `--pretty` on streams. Acceptance is not proof of task completion.
+  Do not use `--pretty` on streams. Acceptance and self idle are not task success.
+  `cancel` with `cancellationState: "notification_sent"` confirms only sending the
+  notification, not run termination.
 - After a timeout or uncertain submission, inspect `runtime` and history before
   retrying, steering, queuing, discarding, or cancelling. Do not claim changes
   succeeded without exit 0 and JSON `ok: true`. Retain receipts and error
@@ -52,7 +54,9 @@ qmacp --quiet runtime "$SESSION_ID"
 
 Long prompts: use stdin (`-`), not nested quoting. Make them self-contained.
 Existing-session `prompt` defaults to `--delivery auto`: idle -> prompt,
-busy and steerable -> steer, otherwise queue. It waits until idle by default.
+busy and steerable -> steer, otherwise queue. Auto delivery and idle waits require
+the updated backend observation contract; unknown/unavailable is not a usable
+phase. Waiting means self-session idle, not descendant/process completion.
 Read [live control](control.md) for delivery, waiting, cancellation, and how to
 label agent-to-agent messages.
 

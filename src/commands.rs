@@ -186,7 +186,7 @@ pub enum Command {
         /// How to send text to an existing session.
         #[arg(long, value_enum, default_value_t = Delivery::Auto)]
         delivery: Delivery,
-        /// Wait until runtime is idle, including queued turns. Default true.
+        /// Wait for self-session idle, including queued turns, not child/process completion.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         until_idle: bool,
         /// `SESSION_ID TEXT` or, with --new, just `TEXT`. Use `-` to read stdin.
@@ -195,7 +195,7 @@ pub enum Command {
     },
     /// Current QueryMT runtime state for a session.
     Runtime { session_id: String },
-    /// Stream compact session events until idle.
+    /// Stream compact session events until self-session idle, not task success.
     Follow {
         session_id: String,
         #[arg(long, default_value_t = 1)]
@@ -203,7 +203,7 @@ pub enum Command {
         #[arg(long, default_value_t = 120)]
         timeout: u64,
     },
-    /// Poll runtime state until idle or timeout.
+    /// Poll runtime state until self-session idle or timeout, not child/process completion.
     Watch {
         session_id: String,
         #[arg(long, default_value_t = 1)]
@@ -239,7 +239,7 @@ pub enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         commands: Vec<String>,
     },
-    /// Cancel the current turn for a session.
+    /// Send a cancellation request for the current turn; does not confirm termination.
     Cancel { session_id: String },
     /// Close a materialized session.
     Close { session_id: String },
@@ -1086,9 +1086,12 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
     };
     recovery["deliveryState"] = json!("accepted");
     recovery["stage"] = json!("observe");
+    if chosen == Delivery::Prompt {
+        recovery["stopReason"] = json!(stop_reason);
+    }
     let mut text = client.take_assistant_text().await;
-    if until_idle {
-        wait_until_idle(
+    let observed = if until_idle {
+        let observed = wait_until_idle(
             client,
             &session_id,
             timeout.unwrap_or(Duration::from_secs(120)),
@@ -1099,7 +1102,10 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
         if !more.is_empty() {
             text = more;
         }
-    }
+        Some(observed)
+    } else {
+        None
+    };
     let mut done = json!({
         "type": "done", "ok": true, "sessionId": session_id,
         "delivery": delivery_name(chosen), "deliveryState": "accepted",
@@ -1107,6 +1113,9 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<CommandOutcome, 
         "stopReason": stop_reason, "text": text,
         "loadSession": initialized.agent_capabilities.load_session,
     });
+    if let Some(observed) = observed {
+        done["runtime"] = observed["runtime"].clone();
+    }
     if let Some(receipt) = receipt {
         done["clientInputId"] = receipt["clientInputId"].clone();
         done["receipt"] = receipt;
@@ -1136,13 +1145,7 @@ async fn choose_delivery(
         return Ok(requested);
     }
     let state = runtime(client, session_id.to_string()).await?;
-    let phase = state
-        .pointer("/runtime/phase")
-        .and_then(Value::as_str)
-        .filter(|phase| !phase.is_empty())
-        .ok_or_else(|| {
-            CliError::rpc("runtime response has no valid phase; input was not submitted")
-        })?;
+    let phase = require_observed_phase(&state)?;
     let steerable = state
         .pointer("/runtime/steerable")
         .and_then(Value::as_bool)
@@ -1150,6 +1153,18 @@ async fn choose_delivery(
             CliError::rpc("runtime response has no valid steerable flag; input was not submitted")
         })?;
     Ok(delivery_from_runtime(phase, steerable))
+}
+
+fn require_observed_phase(state: &Value) -> Result<&str, CliError> {
+    session::observed_phase(&state["runtime"]).ok_or_else(|| {
+        CliError::rpc(
+            "session runtime observation is unavailable or invalid; execution state is unknown",
+        )
+        .with_recovery(json!({
+            "sessionId": state["sessionId"], "stage": "observe",
+            "observationState": "unavailable", "runtime": state["runtime"],
+        }))
+    })
 }
 
 fn delivery_from_runtime(phase: &str, steerable: bool) -> Delivery {
@@ -1166,7 +1181,7 @@ async fn wait_until_idle(
     client: &AcpClient,
     session_id: &str,
     timeout: Duration,
-) -> Result<(), CliError> {
+) -> Result<Value, CliError> {
     wait_until_idle_every(client, session_id, timeout, Duration::from_millis(400)).await
 }
 
@@ -1175,22 +1190,25 @@ async fn wait_until_idle_every(
     session_id: &str,
     timeout: Duration,
     interval: Duration,
-) -> Result<(), CliError> {
-    let mut phase = "unknown".to_string();
+) -> Result<Value, CliError> {
+    let mut last_runtime = Value::Null;
     tokio::time::timeout(timeout.max(Duration::from_secs(1)), async {
         loop {
-            let value = runtime(client, session_id.to_string()).await?;
-            phase = value.pointer("/runtime/phase")
-                .and_then(Value::as_str).unwrap_or("unknown").to_string();
-            if phase == "idle" {
-                return Ok(());
+            let value = runtime(client, session_id.to_string()).await
+                .map_err(|error| error.with_recovery(json!({"runtime": last_runtime})))?;
+            last_runtime = value["runtime"].clone();
+            if require_observed_phase(&value)? == "idle" {
+                return Ok(value);
             }
             tokio::time::sleep(interval.max(Duration::from_millis(200))).await;
         }
     }).await.map_err(|_| CliError::Timeout(format!(
-        "timed out after {}s waiting for session {session_id} to become idle (last phase: {phase}); remote work was not cancelled",
-        timeout.as_secs(),
-    )))?
+        "timed out after {}s waiting for session {session_id} to become idle (last phase: {}); remote work was not cancelled",
+        timeout.as_secs(), last_runtime["phase"].as_str().unwrap_or("unknown"),
+    )).with_recovery(json!({
+        "sessionId": session_id, "stage": "observe", "observationState": "unavailable",
+        "runtime": last_runtime,
+    })))?
 }
 
 async fn follow(
@@ -1202,21 +1220,34 @@ async fn follow(
 ) -> Result<CommandOutcome, CliError> {
     client.initialize().await.map_err(CliError::from_request)?;
     let cwd = session::resolve_cwd(None).map_err(CliError::rpc)?;
-    let _ = open_session(client, session_id.clone(), cwd).await;
+    open_session(client, session_id.clone(), cwd)
+        .await
+        .map_err(|error| {
+            error.with_recovery(json!({
+                "sessionId": session_id, "stage": "open", "observationState": "unavailable",
+            }))
+        })?;
     let _ = client.take_assistant_text().await;
-    wait_until_idle_every(
+    let observed = wait_until_idle_every(
         client,
         &session_id,
         Duration::from_secs(timeout.max(1)),
         Duration::from_secs(interval.max(1)),
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        error.with_recovery(json!({
+            "sessionId": session_id, "stage": "observe", "observationState": "unavailable",
+        }))
+    })?;
     let text = client.take_assistant_text().await;
     let done = json!({
         "type": "done",
         "ok": true,
         "sessionId": session_id,
         "stopReason": "idle",
+        "observationState": "idle",
+        "runtime": observed["runtime"],
         "text": text,
         "interval": interval,
     });
@@ -1229,14 +1260,20 @@ async fn follow(
 }
 
 async fn runtime(client: &AcpClient, session_id: String) -> Result<Value, CliError> {
-    client.initialize().await.map_err(CliError::from_request)?;
+    let recovery = json!({
+        "sessionId": session_id, "stage": "observe", "observationState": "unavailable",
+    });
+    client
+        .initialize()
+        .await
+        .map_err(|error| CliError::from_request(error).with_recovery(recovery.clone()))?;
     let response = client
         .extension(
             "querymt/session/runtimeState",
             json!({ "session_id": session_id }),
         )
         .await
-        .map_err(CliError::from_request)?;
+        .map_err(|error| CliError::from_request(error).with_recovery(recovery))?;
     Ok(json!({
         "sessionId": session_id,
         "runtime": extension_payload(&response),
@@ -1251,32 +1288,32 @@ async fn watch(
     wait_idle: bool,
     pretty: bool,
 ) -> Result<CommandOutcome, CliError> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout.max(1));
     let interval = Duration::from_secs(interval.max(1));
-    loop {
-        let value = runtime(client, session_id.clone()).await?;
-        let phase = value
-            .pointer("/runtime/phase")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
-        output::write_event(&json!({
-            "type": "runtime",
-            "sessionId": session_id,
-            "phase": phase,
-            "runtime": value.get("runtime"),
-        }))
-        .map_err(CliError::rpc)?;
-        if !wait_idle || phase == "idle" {
-            return write_ok(pretty, value);
+    let mut last_runtime = Value::Null;
+    tokio::time::timeout(Duration::from_secs(timeout.max(1)), async {
+        loop {
+            let value = runtime(client, session_id.clone()).await
+                .map_err(|error| error.with_recovery(json!({"runtime": last_runtime})))?;
+            last_runtime = value["runtime"].clone();
+            output::write_event(&json!({
+                "type": "runtime",
+                "sessionId": session_id,
+                "phase": session::observed_phase(&last_runtime).unwrap_or("unknown"),
+                "runtime": last_runtime,
+            }))
+            .map_err(CliError::rpc)?;
+            let phase = require_observed_phase(&value)?;
+            if !wait_idle || phase == "idle" {
+                return write_ok(pretty, value);
+            }
+            tokio::time::sleep(interval).await;
         }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(CliError::Timeout(format!(
-                "watch timed out after {timeout}s while session {session_id} was {phase}"
-            )));
-        }
-        tokio::time::sleep(interval).await;
-    }
+    }).await.map_err(|_| CliError::Timeout(format!(
+        "watch timed out after {timeout}s waiting for session {session_id}; remote work was not cancelled"
+    )).with_recovery(json!({
+        "sessionId": session_id, "stage": "observe", "observationState": "unavailable",
+        "runtime": last_runtime,
+    })))?
 }
 
 async fn submit_input(
@@ -1499,7 +1536,7 @@ async fn cancel(client: &AcpClient, session_id: String) -> Result<Value, CliErro
         .map_err(CliError::from_notification)?;
     Ok(json!({
         "sessionId": session_id,
-        "cancelled": true,
+        "cancellationState": "notification_sent",
     }))
 }
 

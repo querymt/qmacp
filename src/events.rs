@@ -54,6 +54,17 @@ pub fn compact_input_state(params: &Value) -> Option<Value> {
     Some(Value::Object(event))
 }
 
+/// Delegation workflow state is independent of its dispatch tool's status.
+pub fn compact_delegation_update(params: &Value) -> Option<Value> {
+    let fields = params.as_object()?;
+    for key in ["sessionId", "delegationId", "state"] {
+        fields.get(key)?.as_str()?;
+    }
+    let mut event = fields.clone();
+    event.insert("type".to_string(), json!("delegation"));
+    Some(Value::Object(event))
+}
+
 pub fn compact_session_update(session_id: &Value, update: &Value) -> Option<Value> {
     let kind = update
         .get("sessionUpdate")

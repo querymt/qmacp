@@ -57,13 +57,21 @@ Configure: `set-mode` (`build|plan|review`), `set-model`, `set-effort` (`auto|lo
 
 Work: `prompt`, `follow`, `watch`, `steer`, `queue`, `discard-queued`, `exec`, `cancel`, `runtime`
 
-`prompt --new TEXT` creates a session. `prompt SESSION_ID TEXT` continues one. `-` reads the prompt from stdin. `--delivery auto` prompts when idle, steers when the turn is steerable, otherwise queues. It waits until idle, including queued turns.
+`prompt --new TEXT` creates a session. `prompt SESSION_ID TEXT` continues one. `-` reads the prompt from stdin. `--delivery auto` prompts when idle, steers when the turn is steerable, otherwise queues. Auto delivery and idle waits require the updated backend observation metadata; unknown/unavailable status is not usable.
+
+Prompt/follow/watch wait for self-session idle, including queued turns, not for
+child workflows or detached processes. Idle is not task success. Idle results
+retain runtime observation health and separate direct delegation activity.
 
 `queue SESSION_ID -` and `steer SESSION_ID -` read stdin and return a submission
 receipt without loading history. `prompt --delivery queue|steer --until-idle false`
 also returns after submission; idle/direct prompt delivery still waits for its turn.
 
 `discard-queued` takes the `inputId` from an `input_state` event. That is the same value as `clientInputId` from the submit response.
+
+`cancel` sends a cancellation notification for the current turn. Its
+`cancellationState: "notification_sent"` confirms the local write/flush, not run
+termination or task success. It does not discard queued inputs or cancel children.
 
 `find` reports `pagesScanned`, `truncated`, `pageCapReached`, and `stopReason`
 so callers can distinguish a complete search from a result/page limit.
@@ -102,7 +110,11 @@ a final `type: done` result. `watch` also emits `runtime` events.
 
 Exit codes: 0 ok, 1 usage, 2 connection, 3 RPC, 4 timeout or cancel.
 
-Event types: `session`, `submitted`, `text`, `tool`, `mode`, `plan`, `input_state`, `permission`, `elicitation`, `runtime`, `update`, `done`.
+Event types: `session`, `submitted`, `text`, `tool`, `delegation`, `mode`, `plan`, `input_state`, `permission`, `elicitation`, `runtime`, `update`, `done`.
+
+`delegation` records describe workflow lifecycle separately from dispatch `tool`
+status. Compact `inspect` includes snapshot `delegations`; successful dispatch
+alone does not establish delegation success.
 
 Submission receipts retain `clientInputId`; partial-failure errors include known
 IDs and delivery state in `recovery`. Acceptance is not task completion. See

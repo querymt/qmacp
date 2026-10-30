@@ -108,9 +108,10 @@ notify_callback() {
   steering; `steer --run-id` can target an exact active run. Do not assume
   queue-only delivery wakes an idle session. See [live control](control.md)
   for direct commands, including stdin delivery without history loading.
-- `--until-idle false` avoids waiting for all subsequent work after
-  steer/queue. It is **not** fire-and-forget for an idle session: the prompt
-  RPC still waits for that turn, bounded here by `--timeout 900`. Keep the
+- `--until-idle false` skips the self-session idle wait after steer/queue.
+  That wait never implies descendant workflow or detached process completion.
+  It is **not** fire-and-forget for an idle session: the prompt RPC still waits
+  for that turn, bounded here by `--timeout 900`. Keep the
   delivery process supervised.
 - Keep stdout NDJSON and stderr in the watcher logs; check exit status and the
   final `done` event. Submission/`done` alone does not prove the agent handled

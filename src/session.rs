@@ -4,6 +4,8 @@ use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
+use crate::events;
+
 const SESSION_LOAD_SNAPSHOT_META_KEY: &str = "querymt/sessionLoadSnapshot.v1";
 const INSPECT_TEXT_LIMIT: usize = 4_000;
 const FIND_PAGE_CAP: usize = 20;
@@ -33,6 +35,29 @@ pub fn profile_meta(profile_id: &str) -> Map<String, Value> {
     meta
 }
 
+/// A usable self-execution phase requires an available backend observation.
+pub fn observed_phase(runtime: &Value) -> Option<&str> {
+    let phase = runtime.get("phase")?.as_str()?;
+    match runtime.pointer("/observation/availability")?.as_str()? {
+        "live"
+            if matches!(
+                phase,
+                "idle"
+                    | "starting"
+                    | "model"
+                    | "tools"
+                    | "waiting"
+                    | "closing"
+                    | "cancel_requested"
+            ) =>
+        {
+            Some(phase)
+        }
+        "inactive" if phase == "idle" => Some(phase),
+        _ => None,
+    }
+}
+
 pub fn session_summary(session: &acp::SessionInfo) -> Value {
     compact_session_summary(session)
 }
@@ -44,12 +69,16 @@ pub fn compact_session_summary(session: &acp::SessionInfo) -> Value {
         .and_then(|meta| serde_json::to_value(meta).ok())
         .unwrap_or(Value::Null);
     let runtime = meta.get("runtimeStatus").cloned().unwrap_or(Value::Null);
+    let phase = runtime
+        .get("phase")
+        .filter(|phase| !phase.is_null())
+        .map(|_| observed_phase(&runtime).unwrap_or("unknown"));
     let mut summary = json!({
         "sessionId": session.session_id.to_string(),
         "cwd": path_string(&session.cwd),
         "title": session.title,
         "updatedAt": session.updated_at,
-        "phase": runtime.get("phase").cloned(),
+        "phase": phase,
         "messageCount": meta.get("messageCount").cloned(),
         "runtime": runtime,
     });
@@ -172,8 +201,19 @@ pub fn compact_inspect(
         } else {
             Value::Array(Vec::new())
         },
+        "delegations": compact_delegations(snapshot),
         "errors": compact_errors(snapshot),
     })
+}
+
+fn compact_delegations(snapshot: Option<&Value>) -> Vec<Value> {
+    snapshot
+        .and_then(|snapshot| snapshot.get("delegationUpdates"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(events::compact_delegation_update)
+        .collect()
 }
 
 fn session_load_snapshot(response: &Value) -> Option<&Value> {
@@ -287,12 +327,7 @@ pub fn matches_query_and_phase(session: &Value, query: &str, phase: Option<&str>
         let current = session
             .get("phase")
             .and_then(Value::as_str)
-            .or_else(|| {
-                session
-                    .get("runtime")
-                    .and_then(|runtime| runtime.get("phase"))
-                    .and_then(Value::as_str)
-            })
+            .or_else(|| session.get("runtime").and_then(observed_phase))
             .unwrap_or("");
         if !current.eq_ignore_ascii_case(phase) {
             return false;

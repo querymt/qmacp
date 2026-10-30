@@ -585,6 +585,14 @@ async fn handle_inbound(
         event_sink.emit(event).await;
     }
 
+    if matches!(
+        method.as_str(),
+        "querymt/session/delegationUpdate" | "_querymt/session/delegationUpdate"
+    ) && let Some(event) = events::compact_delegation_update(&params)
+    {
+        event_sink.emit(event).await;
+    }
+
     if let Some(id) = value.get("id").cloned() {
         let (reply, event) = inbound_request_reply(id, &method, &params, permission)?;
         if let Some(event) = event {

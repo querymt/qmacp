@@ -13,6 +13,7 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 enum Reply {
     Result(Value),
+    WithNotifications(Vec<Value>, Value),
     Error(i64, &'static str),
     Disconnect,
     Pending,
@@ -49,6 +50,15 @@ impl MockServer {
                     Reply::Result(result) => json!({
                         "jsonrpc": "2.0", "id": request["id"], "result": result,
                     }),
+                    Reply::WithNotifications(notifications, result) => {
+                        for notification in notifications {
+                            socket
+                                .send(Message::Text(notification.to_string().into()))
+                                .await
+                                .unwrap();
+                        }
+                        json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+                    }
                     Reply::Error(code, message) => json!({
                         "jsonrpc": "2.0", "id": request["id"],
                         "error": {"code": code, "message": message},
@@ -115,7 +125,10 @@ fn events(output: &Output) -> Vec<Value> {
 }
 
 fn runtime(phase: &str, steerable: bool) -> Reply {
-    Reply::Result(json!({"phase": phase, "steerable": steerable, "active_run_id": "run-1"}))
+    Reply::Result(json!({
+        "phase": phase, "steerable": steerable, "active_run_id": "run-1",
+        "observation": {"availability": "live", "epoch": "actor-1", "revision": 1},
+    }))
 }
 
 fn accepted(request: &Value) -> Reply {
@@ -199,6 +212,14 @@ async fn nonwaiting_prompts_emit_receipts_without_resume_load_or_prompt_rpcs() {
         let done = events.last().unwrap();
         assert_eq!(done["type"], "done");
         assert_eq!(done["observationState"], "not_waited");
+        assert_eq!(
+            done["stopReason"],
+            if method == "steer" {
+                "steered"
+            } else {
+                "queued"
+            }
+        );
         assert_eq!(receipt["clientInputId"], done["clientInputId"]);
         let requests = server.finish().await;
         assert_eq!(requests.last().unwrap()["params"]["prompt"][0]["text"], "-");
@@ -721,6 +742,639 @@ async fn idle_observation_does_not_replay_history_or_claim_task_completion() {
     assert_eq!(done["observationState"], "idle");
     assert_eq!(done["text"], "");
     server.finish().await;
+}
+
+fn delegation(state: &str, seq: u64) -> Value {
+    json!({
+        "version": 1, "sessionId": "parent", "delegationId": "delegation-1",
+        "toolCallId": "dispatch-1", "childSessionId": "child-1", "targetAgentId": "coder",
+        "objective": "fixture task", "state": state, "activity": "historical",
+        "requestedAt": 1, "forkedAt": 2, "updatedAt": seq,
+        "sourceEpoch": "workflow-1", "sessionSeq": seq,
+    })
+}
+
+fn delegation_notification(method: &str, update: &Value) -> Value {
+    json!({"jsonrpc": "2.0", "method": method, "params": update})
+}
+
+fn assert_delegation_event(event: &Value, update: &Value) {
+    assert_eq!(event["type"], "delegation");
+    for (key, value) in update.as_object().unwrap() {
+        assert_eq!(&event[key], value, "lost delegation field {key}");
+    }
+}
+
+#[tokio::test]
+async fn follow_streams_delegation_lifecycle_separately_from_tool_dispatch_during_load() {
+    let mut verifying = delegation("forked", 3);
+    verifying["activity"] = json!("live");
+    verifying["stage"] = json!("verifying");
+    let mut terminal = delegation("completed", 4);
+    terminal["finishedAt"] = json!(4);
+    terminal["resultSummary"] = json!("verified");
+    let expected = [verifying.clone(), terminal.clone()];
+    let server = MockServer::start(move |request| match request["method"].as_str().unwrap() {
+        "session/resume" => Reply::Error(-32601, "resume unsupported"),
+        "session/load" => Reply::WithNotifications(vec![
+            json!({"jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": "parent", "update": {"sessionUpdate": "tool_call_update", "toolCallId": "dispatch-1", "status": "completed"},
+            }}),
+            delegation_notification("querymt/session/delegationUpdate", &verifying),
+            delegation_notification("querymt/session/delegationUpdate", &terminal),
+        ], json!({"_meta": {"querymt/sessionLoadSnapshot.v1": {"delegationUpdates": [verifying]}}})),
+        "_querymt/session/runtimeState" => runtime("idle", false),
+        _ => unexpected(request),
+    }).await;
+    let output = invoke(
+        cli().args(["--url", &server.url, "--quiet", "follow", "parent"]),
+        None,
+    )
+    .await;
+    assert!(output.status.success(), "{output:?}");
+    let events = events(&output);
+    let tool = events.iter().find(|event| event["type"] == "tool").unwrap();
+    assert_eq!(tool["id"], "dispatch-1");
+    assert_eq!(tool["status"], "completed");
+    let updates: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "delegation")
+        .collect();
+    assert_eq!(updates.len(), 2, "{events:?}");
+    for (event, update) in updates.iter().zip(&expected) {
+        assert_delegation_event(event, update);
+    }
+    assert_eq!(events.last().unwrap()["observationState"], "idle");
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn exported_event_channel_delivers_terminal_delegation_update_buffered_during_load() {
+    let historical = delegation("forked", 2);
+    let mut terminal = delegation("cancelled", 4);
+    terminal["finishedAt"] = json!(4);
+    terminal["error"] = json!("fixture cancellation");
+    let expected = terminal.clone();
+    let server = MockServer::start(move |request| {
+        assert_eq!(request["method"], "session/load");
+        Reply::WithNotifications(
+            vec![delegation_notification("_querymt/session/delegationUpdate", &terminal)],
+            json!({"_meta": {"querymt/sessionLoadSnapshot.v1": {"delegationUpdates": [historical]}}}),
+        )
+    }).await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let client = qmacp::client::AcpClient::connect_with_events(
+        &server.url,
+        "fixture",
+        qmacp::policy::PermissionPolicy::Cancel,
+        tx,
+    )
+    .await
+    .unwrap();
+    client.initialize().await.unwrap();
+    let (_, raw) = client
+        .load_session("parent".into(), "/tmp".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        raw["_meta"]["querymt/sessionLoadSnapshot.v1"]["delegationUpdates"][0]["state"],
+        "forked"
+    );
+    let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_delegation_event(&event, &expected);
+    drop(client);
+    server.finish().await;
+}
+
+fn enriched_remote_load(update: &Value) -> Value {
+    let activity = if update["activity"] == "live" {
+        vec![update.clone()]
+    } else {
+        Vec::new()
+    };
+    json!({"_meta": {
+        "location": "remote", "nodeId": "fixture-peer",
+        "querymt/sessionLoadSnapshot.v1": {
+            "runtimeStatus": {
+                "phase": "idle", "steerable": false, "active_run_id": null,
+                "observation": {"availability": "live", "epoch": "remote-actor", "revision": 9},
+                "delegation_activity": activity,
+            },
+            "delegationUpdates": [update],
+            "audit": {"events": [{"kind": {"type": "tool_call_end", "data": {
+                "tool_call_id": "dispatch-1", "tool_name": "delegate", "is_error": false, "result": "dispatched",
+            }}}]},
+        },
+    }})
+}
+
+#[tokio::test]
+async fn exported_load_preserves_enriched_initial_snapshot_without_notifications() {
+    let mut verifying = delegation("forked", 3);
+    verifying["activity"] = json!("live");
+    verifying["stage"] = json!("verifying");
+    let expected = enriched_remote_load(&verifying);
+    let response = expected.clone();
+    let server = MockServer::start(move |request| {
+        assert_eq!(request["method"], "session/load");
+        Reply::Result(response.clone())
+    })
+    .await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let client = qmacp::client::AcpClient::connect_with_events(
+        &server.url,
+        "fixture",
+        qmacp::policy::PermissionPolicy::Cancel,
+        tx,
+    )
+    .await
+    .unwrap();
+    client.initialize().await.unwrap();
+    let (loaded, raw) = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.load_session("parent".into(), "/tmp".into()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(loaded.meta.is_some());
+    assert_eq!(raw, expected);
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    drop(client);
+    let requests = server.finish().await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "only initialize and load, no runtime query"
+    );
+}
+
+#[tokio::test]
+async fn inspect_keeps_initial_remote_delegation_separate_from_dispatch_on_reconnect() {
+    for state in ["forked", "failed"] {
+        let mut update = delegation(state, if state == "forked" { 3 } else { 4 });
+        if state == "forked" {
+            update["activity"] = json!("live");
+            update["stage"] = json!("verifying");
+        } else {
+            update["finishedAt"] = json!(4);
+            update["error"] = json!("verification failed");
+        }
+        let expected = enriched_remote_load(&update);
+        for full in [false, true] {
+            let response = expected.clone();
+            let server = MockServer::start(move |request| {
+                assert_eq!(request["method"], "session/load");
+                Reply::Result(response.clone())
+            })
+            .await;
+            let mut command = cli();
+            command.args(["--url", &server.url, "--quiet", "inspect", "parent"]);
+            if full {
+                command.arg("--full");
+            }
+            let output = invoke(&mut command, None).await;
+            assert!(output.status.success(), "{output:?}");
+            let result_events = events(&output);
+            assert_eq!(
+                result_events.len(),
+                1,
+                "snapshot only, no live notifications"
+            );
+            let result = &result_events[0];
+            if full {
+                assert_eq!(result["raw"], expected);
+            } else {
+                assert_eq!(result["tools"][0]["id"], "dispatch-1");
+                assert_eq!(result["tools"][0]["status"], "ok");
+                let updates = result["delegations"]
+                    .as_array()
+                    .expect("compact delegation snapshot");
+                assert_eq!(updates.len(), 1);
+                assert_delegation_event(&updates[0], &update);
+            }
+            assert_eq!(server.finish().await.len(), 2, "no catchup runtime query");
+        }
+    }
+}
+
+#[tokio::test]
+async fn unavailable_runtime_prevents_auto_delivery() {
+    for state in [
+        json!({"phase": "unknown", "steerable": false, "observation": {"availability": "unavailable", "reason": "owner_unavailable"}}),
+        json!({"phase": "idle", "steerable": false, "observation": {"availability": "unavailable"}}),
+        json!({"phase": "idle", "steerable": false}),
+    ] {
+        let server = MockServer::start(move |request| match request["method"].as_str().unwrap() {
+            "_querymt/session/runtimeState" => Reply::Result(state.clone()),
+            "session/resume" | "session/load" => Reply::Result(json!({})),
+            "session/prompt" => Reply::Result(json!({"stopReason": "end_turn"})),
+            "_querymt/session/queue" => accepted(request),
+            _ => unexpected(request),
+        })
+        .await;
+        let output = invoke(
+            cli().args([
+                "--url",
+                &server.url,
+                "--quiet",
+                "prompt",
+                "--until-idle",
+                "false",
+                "target",
+                "work",
+            ]),
+            None,
+        )
+        .await;
+        assert_eq!(output.status.code(), Some(3), "{output:?}");
+        let error = events(&output).pop().unwrap();
+        assert_eq!(error["recovery"]["deliveryState"], "not_submitted");
+        assert_eq!(error["recovery"]["observationState"], "unavailable");
+        assert_eq!(server.finish().await.len(), 2, "must not open or submit");
+    }
+}
+
+#[tokio::test]
+async fn unavailable_observation_fails_follow_and_watch_instead_of_reporting_completion() {
+    for command in ["follow", "watch"] {
+        let state = json!({"phase": "unknown", "steerable": false, "observation": {
+            "availability": "unavailable", "reason": "owner_unavailable",
+        }});
+        let expected = state.clone();
+        let server = MockServer::start(move |request| match request["method"].as_str().unwrap() {
+            "session/resume" | "session/load" => Reply::Result(json!({})),
+            "_querymt/session/runtimeState" => Reply::Result(state.clone()),
+            _ => unexpected(request),
+        })
+        .await;
+        let mut cli = cli();
+        cli.args([
+            "--url",
+            &server.url,
+            "--quiet",
+            command,
+            "target",
+            "--timeout",
+            "1",
+        ]);
+        if command == "watch" {
+            cli.args(["--idle", "false"]);
+        }
+        let output = invoke(&mut cli, None).await;
+        assert_eq!(output.status.code(), Some(3), "{output:?}");
+        let events = events(&output);
+        assert!(events.iter().all(|event| event["type"] != "done"));
+        let recovery = &events.last().unwrap()["recovery"];
+        assert_eq!(recovery["sessionId"], "target");
+        assert_eq!(recovery["stage"], "observe");
+        assert_eq!(recovery["observationState"], "unavailable");
+        assert_eq!(recovery["runtime"], expected);
+        server.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn self_idle_waits_preserve_dependency_activity_without_waiting_for_children() {
+    for command in ["prompt", "follow", "watch"] {
+        let state = json!({
+            "phase": "idle", "steerable": false, "active_run_id": null,
+            "observation": {"availability": "inactive"},
+            "delegation_activity": [{"delegationId": "delegate-1", "stage": "verifying", "activity": "live", "sourceEpoch": "workflow-epoch", "sessionSeq": 4}],
+        });
+        let expected = state.clone();
+        let server = MockServer::start(move |request| match request["method"].as_str().unwrap() {
+            "session/resume" | "session/load" => Reply::Result(json!({})),
+            "_querymt/session/queue" => accepted(request),
+            "_querymt/session/runtimeState" => Reply::Result(state.clone()),
+            _ => unexpected(request),
+        })
+        .await;
+        let mut cli = cli();
+        cli.args(["--url", &server.url, "--quiet", command]);
+        if command == "prompt" {
+            cli.args(["--delivery", "queue", "--timeout", "1", "target", "work"]);
+        } else {
+            cli.args(["target", "--timeout", "1"]);
+        }
+        let output = invoke(&mut cli, None).await;
+        assert!(output.status.success(), "{output:?}");
+        let done = events(&output).pop().unwrap();
+        assert_eq!(done["runtime"], expected);
+        if command != "watch" {
+            assert_eq!(done["observationState"], "idle");
+        }
+        server.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn watch_timeout_bounds_a_stalled_runtime_request() {
+    let server = MockServer::start(|request| {
+        assert_eq!(request["method"], "_querymt/session/runtimeState");
+        Reply::Pending
+    })
+    .await;
+    let output = invoke(
+        cli().args([
+            "--url",
+            &server.url,
+            "--quiet",
+            "watch",
+            "target",
+            "--timeout",
+            "1",
+        ]),
+        None,
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
+    assert_eq!(
+        events(&output).last().unwrap()["recovery"]["sessionId"],
+        "target"
+    );
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn accepted_prompt_observation_disconnect_preserves_receipt_without_replaying() {
+    let mut observed = false;
+    let server = MockServer::start(move |request| match request["method"].as_str().unwrap() {
+        "_querymt/session/queue" => accepted(request),
+        "_querymt/session/runtimeState" if !observed => {
+            observed = true;
+            runtime("tools", false)
+        }
+        "_querymt/session/runtimeState" => Reply::Disconnect,
+        _ => unexpected(request),
+    })
+    .await;
+    let output = invoke(
+        cli().args([
+            "--url",
+            &server.url,
+            "--quiet",
+            "prompt",
+            "--delivery",
+            "queue",
+            "target",
+            "work",
+        ]),
+        None,
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let events = events(&output);
+    let submitted = events
+        .iter()
+        .find(|event| event["type"] == "submitted")
+        .unwrap();
+    let recovery = &events.last().unwrap()["recovery"];
+    assert_eq!(recovery["deliveryState"], "accepted");
+    assert_eq!(recovery["clientInputId"], submitted["clientInputId"]);
+    assert_eq!(recovery["receipt"], submitted["receipt"]);
+    assert_eq!(recovery["observationState"], "unavailable");
+    assert_eq!(recovery["runtime"]["active_run_id"], "run-1");
+    assert_eq!(recovery["runtime"]["phase"], "tools");
+    assert!(events.iter().all(|event| event["type"] != "done"));
+    assert_eq!(server.finish().await.len(), 4);
+}
+
+#[tokio::test]
+async fn accepted_queue_and_steer_recovery_does_not_claim_prompt_outcome() {
+    for delivery in ["queue", "steer"] {
+        let mut submitted = false;
+        let server = MockServer::start(move |request| match request["method"].as_str().unwrap() {
+            "_querymt/session/queue" | "_querymt/session/steer" => {
+                submitted = true;
+                accepted(request)
+            }
+            "_querymt/session/runtimeState" if !submitted => runtime("tools", true),
+            "_querymt/session/runtimeState" => Reply::Result(json!({
+                "phase": "unknown", "observation": {"availability": "unavailable", "reason": "owner_unavailable"},
+            })),
+            _ => unexpected(request),
+        }).await;
+        let output = invoke(
+            cli().args([
+                "--url",
+                &server.url,
+                "--quiet",
+                "prompt",
+                "--delivery",
+                delivery,
+                "--timeout",
+                "1",
+                "target",
+                "work",
+            ]),
+            None,
+        )
+        .await;
+        assert_eq!(output.status.code(), Some(3), "{output:?}");
+        let events = events(&output);
+        let submitted = events
+            .iter()
+            .find(|event| event["type"] == "submitted")
+            .unwrap();
+        let recovery = &events.last().unwrap()["recovery"];
+        assert_eq!(recovery["sessionId"], "target");
+        assert_eq!(recovery["stage"], "observe");
+        assert_eq!(recovery["delivery"], delivery);
+        assert_eq!(recovery["deliveryState"], "accepted");
+        assert_eq!(recovery["clientInputId"], submitted["clientInputId"]);
+        assert_eq!(recovery["receipt"], submitted["receipt"]);
+        assert_eq!(recovery["observationState"], "unavailable");
+        assert_eq!(
+            recovery["runtime"]["observation"]["reason"],
+            "owner_unavailable"
+        );
+        assert!(events.iter().all(|event| event["type"] != "done"));
+        assert!(
+            recovery.get("stopReason").is_none(),
+            "{delivery}: {recovery}"
+        );
+        let requests = server.finish().await;
+        assert!(
+            requests
+                .iter()
+                .all(|request| request["method"] != "session/prompt")
+        );
+        assert_eq!(requests.len(), if delivery == "steer" { 4 } else { 3 });
+    }
+}
+
+#[tokio::test]
+async fn returned_prompt_keeps_its_stop_reason_when_later_observation_fails() {
+    let server = MockServer::start(|request| match request["method"].as_str().unwrap() {
+        "session/new" => Reply::Result(json!({"sessionId": "created-session"})),
+        "session/prompt" => Reply::Result(json!({"stopReason": "cancelled"})),
+        "_querymt/session/runtimeState" => Reply::Result(json!({
+            "phase": "unknown", "observation": {"availability": "unavailable"},
+        })),
+        _ => unexpected(request),
+    })
+    .await;
+    let output = invoke(
+        cli().args(["--url", &server.url, "--quiet", "prompt", "--new", "work"]),
+        None,
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    let events = events(&output);
+    let recovery = &events.last().unwrap()["recovery"];
+    assert_eq!(recovery["sessionId"], "created-session");
+    assert_eq!(recovery["creationState"], "created");
+    assert_eq!(recovery["deliveryState"], "accepted");
+    assert_eq!(recovery["stopReason"], "cancelled");
+    assert_eq!(recovery["observationState"], "unavailable");
+    assert!(events.iter().all(|event| event["type"] != "done"));
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn discovery_preserves_unknown_observations_and_filters_only_known_phases() {
+    let remote_runtime = json!({
+        "phase": "tools", "active_run_id": "remote-run",
+        "observation": {"availability": "live", "epoch": "remote-actor", "revision": 9},
+    });
+    let listed = vec![
+        json!({"sessionId": "missing", "cwd": "/tmp"}),
+        json!({"sessionId": "offline", "cwd": "/tmp", "_meta": {"runtimeStatus": {
+            "phase": "unknown", "observation": {"availability": "unavailable", "reason": "owner_unavailable"},
+        }}}),
+        json!({"sessionId": "unobserved", "cwd": "/tmp", "_meta": {"runtimeStatus": {"phase": "idle"}}}),
+        json!({"sessionId": "parent", "cwd": "/tmp", "_meta": {"runtimeStatus": {
+            "phase": "idle", "observation": {"availability": "inactive"},
+            "delegation_activity": [{"stage": "verifying", "activity": "live"}],
+        }}}),
+        json!({"sessionId": "busy", "cwd": "/tmp", "_meta": {"runtimeStatus": {
+            "phase": "tools", "active_run_id": "run-B", "observation": {"availability": "live", "epoch": "actor-1", "revision": 8},
+        }}}),
+        json!({"sessionId": "null-phase", "cwd": "/tmp", "_meta": {"runtimeStatus": {"phase": null}}}),
+        json!({"sessionId": "remote-busy", "cwd": "/tmp", "_meta": {"runtimeStatus": remote_runtime}}),
+    ];
+    for phase in [None, Some("idle"), Some("unknown"), Some("tools")] {
+        let listed = listed.clone();
+        let server = MockServer::start(move |request| {
+            assert_eq!(request["method"], "session/list");
+            Reply::Result(json!({"sessions": listed}))
+        })
+        .await;
+        let mut cli = cli();
+        cli.args(["--url", &server.url, "--quiet"]);
+        if let Some(phase) = phase {
+            cli.args(["find", "--phase", phase]);
+        } else {
+            cli.arg("sessions");
+        }
+        let output = invoke(&mut cli, None).await;
+        assert!(output.status.success(), "{output:?}");
+        let result = events(&output).pop().unwrap();
+        let sessions = result["sessions"].as_array().unwrap();
+        let ids: Vec<_> = sessions
+            .iter()
+            .map(|session| session["sessionId"].as_str().unwrap())
+            .collect();
+        match phase {
+            Some("idle") => assert_eq!(ids, ["parent"]),
+            Some("unknown") => assert_eq!(ids, ["offline", "unobserved"]),
+            Some("tools") => assert_eq!(ids, ["busy", "remote-busy"]),
+            None => {
+                assert!(sessions[0]["phase"].is_null());
+                assert_eq!(
+                    sessions[1]["runtime"]["observation"]["availability"],
+                    "unavailable"
+                );
+                assert_eq!(
+                    sessions[3]["runtime"]["delegation_activity"][0]["stage"],
+                    "verifying"
+                );
+                assert_eq!(sessions[4]["runtime"]["active_run_id"], "run-B");
+                assert_eq!(sessions[4]["runtime"]["observation"]["revision"], 8);
+                assert!(sessions[5]["phase"].is_null());
+                assert_eq!(sessions[5]["runtime"], json!({"phase": null}));
+                assert_eq!(sessions[6]["phase"], "tools");
+                assert!(sessions[6]["messageCount"].is_null());
+                assert_eq!(sessions[6]["runtime"], remote_runtime);
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            server.finish().await.len(),
+            2,
+            "listing must not issue per-session runtime queries"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancel_reports_only_a_sent_notification_without_waiting_for_termination() {
+    let server = MockServer::start(|request| {
+        assert_eq!(request["method"], "session/cancel");
+        assert!(
+            request.get("id").is_none(),
+            "cancel must remain a notification"
+        );
+        assert_eq!(request["params"], json!({"sessionId": "target"}));
+        Reply::Pending
+    })
+    .await;
+    let output = invoke(
+        cli().args(["--url", &server.url, "--quiet", "cancel", "target"]),
+        None,
+    )
+    .await;
+    assert!(output.status.success(), "{output:?}");
+    let result = events(&output).pop().unwrap();
+    assert_eq!(result["cancellationState"], "notification_sent");
+    assert_eq!(result["sessionId"], "target");
+    assert_eq!(result["ok"], true);
+    assert!(result.get("cancelled").is_none());
+    assert_eq!(server.finish().await.len(), 2);
+}
+
+#[tokio::test]
+async fn follow_does_not_report_done_when_opening_the_session_fails() {
+    let server = MockServer::start(|request| match request["method"].as_str().unwrap() {
+        "session/resume" => Reply::Error(-32601, "resume unsupported"),
+        "session/load" => Reply::Error(-32603, "session observation failed"),
+        "_querymt/session/runtimeState" => runtime("idle", false),
+        _ => unexpected(request),
+    })
+    .await;
+    let output = invoke(
+        cli().args([
+            "--url",
+            &server.url,
+            "--quiet",
+            "follow",
+            "target",
+            "--timeout",
+            "1",
+        ]),
+        None,
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    let events = events(&output);
+    assert!(events.iter().all(|event| event["type"] != "done"));
+    let recovery = &events.last().unwrap()["recovery"];
+    assert_eq!(recovery["sessionId"], "target");
+    assert_eq!(recovery["stage"], "open");
+    assert_eq!(recovery["observationState"], "unavailable");
+    let requests = server.finish().await;
+    assert!(
+        requests
+            .iter()
+            .all(|request| request["method"] != "_querymt/session/runtimeState")
+    );
 }
 
 #[tokio::test]

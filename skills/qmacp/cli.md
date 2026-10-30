@@ -39,29 +39,50 @@ qmacp [--url URL] [--allow-insecure] [--pretty] [--permission allow-once|reject-
 - `prompt`, `follow`, `exec`, and opt-in `new --stream`: NDJSON.
   `watch` emits `runtime` events, then a final JSON object.
   Connection logs go to stderr.
-- Success requires exit 0 and JSON `ok` not false. `prompt`, `follow`, and
+- Command success requires exit 0 and JSON `ok` not false. `prompt`, `follow`, and
   `new --stream` also require a terminal `"type":"done"`. `exec` emits individual
   command results, not a global `done`.
 - Exit codes: 0 success, 1 usage, 2 connection, 3 RPC, 4 timeout/cancel.
 
-Stream event types: `session`, `submitted`, `text`, `tool`, `mode`, `plan`,
-`input_state`, `permission`, `elicitation`, `runtime`, `update`, `done`.
-Do not claim a cancel/discard/close/config change succeeded without exit 0 and
-JSON `ok: true`. Inspect current state after uncertain delivery rather than retrying
-blindly; see [live control](control.md).
+Stream event types: `session`, `submitted`, `text`, `tool`, `delegation`, `mode`,
+`plan`, `input_state`, `permission`, `elicitation`, `runtime`, `update`, `done`.
+`delegation` is a separate lifecycle record from `querymt/session/delegationUpdate`,
+also delivered by the exported `AcpClient::connect_with_events` channel. It retains
+backend identities, state, child/tool links, stage/activity, outcome details and
+`sourceEpoch`/`sessionSeq` when supplied, without inferred defaults. A completed
+`tool` can mean only successful dispatch while its delegation is still verifying
+or later fails. Delegation ordering is separate from self-runtime revisions;
+records are forwarded, not merged into a client-side state cache.
+
+Require exit 0 and JSON `ok: true` for command success. For `cancel`,
+`cancellationState: "notification_sent"` confirms only the local notification
+write/flush, not backend acceptance or execution termination. Inspect current
+state after uncertain delivery rather than retrying blindly; see [live control](control.md).
 
 `new --stream`/`prompt --new` emit `sessionId` before configuration. Default
 `new` still returns one object. Queue/steer prompts emit `submitted` with
 `clientInputId` and `receipt` before waiting; `done` retains them.
 
 On failure, `recovery` preserves known IDs, the failing `stage`
-(`create|configure|submit|observe`), and creation/delivery state. `not_submitted`
+(`create|configure|submit|open|observe`), and creation/delivery state. `not_submitted`
 or `rejected` differs from `unknown`; `accepted` means a receipt was received,
 not that the task completed. Inspect state before retrying an uncertain or
 accepted submission. A lost creation response cannot provide a session ID.
 
-`observationState` is `not_waited`, `idle`, or `prompt_returned`, not proof of
-task success. `text` contains only assistant text observed on this connection.
+Successful prompt `observationState` is `not_waited`, `idle`, or `prompt_returned`;
+follow reports `idle`. None proves task success. Idle results retain `runtime`,
+including backend observation health, run identity and direct delegation activity.
+Self idle does not mean descendants finished or detached OS processes exited.
+The prompt RPC `stopReason` is separate from idle evidence; it is also retained in
+recovery when observation fails after the RPC returned. It does not describe a
+later queued run. No terminal outcome is inferred from idle.
+
+Open/observation failures emit no successful `done`; recovery reports
+`observationState: "unavailable"` with the session ID and runtime evidence when
+available. A retained runtime may be the last known observation, not current
+liveness. Updated backend observation metadata is required for auto delivery and
+waits; absent/unknown/unavailable health is not a usable busy or idle state.
+`text` contains only assistant text observed on this connection.
 
 ## Permissions
 
