@@ -849,8 +849,74 @@ async fn exported_event_channel_delivers_terminal_delegation_update_buffered_dur
     server.finish().await;
 }
 
+fn enriched_remote_load(update: &Value) -> Value {
+    let activity = if update["activity"] == "live" {
+        vec![update.clone()]
+    } else {
+        Vec::new()
+    };
+    json!({"_meta": {
+        "location": "remote", "nodeId": "fixture-peer",
+        "querymt/sessionLoadSnapshot.v1": {
+            "runtimeStatus": {
+                "phase": "idle", "steerable": false, "active_run_id": null,
+                "observation": {"availability": "live", "epoch": "remote-actor", "revision": 9},
+                "delegation_activity": activity,
+            },
+            "delegationUpdates": [update],
+            "audit": {"events": [{"kind": {"type": "tool_call_end", "data": {
+                "tool_call_id": "dispatch-1", "tool_name": "delegate", "is_error": false, "result": "dispatched",
+            }}}]},
+        },
+    }})
+}
+
 #[tokio::test]
-async fn compact_inspect_keeps_delegation_status_separate_from_dispatch_on_reconnect() {
+async fn exported_load_preserves_enriched_initial_snapshot_without_notifications() {
+    let mut verifying = delegation("forked", 3);
+    verifying["activity"] = json!("live");
+    verifying["stage"] = json!("verifying");
+    let expected = enriched_remote_load(&verifying);
+    let response = expected.clone();
+    let server = MockServer::start(move |request| {
+        assert_eq!(request["method"], "session/load");
+        Reply::Result(response.clone())
+    })
+    .await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let client = qmacp::client::AcpClient::connect_with_events(
+        &server.url,
+        "fixture",
+        qmacp::policy::PermissionPolicy::Cancel,
+        tx,
+    )
+    .await
+    .unwrap();
+    client.initialize().await.unwrap();
+    let (loaded, raw) = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.load_session("parent".into(), "/tmp".into()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(loaded.meta.is_some());
+    assert_eq!(raw, expected);
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    drop(client);
+    let requests = server.finish().await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "only initialize and load, no runtime query"
+    );
+}
+
+#[tokio::test]
+async fn inspect_keeps_initial_remote_delegation_separate_from_dispatch_on_reconnect() {
     for state in ["forked", "failed"] {
         let mut update = delegation(state, if state == "forked" { 3 } else { 4 });
         if state == "forked" {
@@ -860,31 +926,41 @@ async fn compact_inspect_keeps_delegation_status_separate_from_dispatch_on_recon
             update["finishedAt"] = json!(4);
             update["error"] = json!("verification failed");
         }
-        let expected = update.clone();
-        let server = MockServer::start(move |request| {
-            assert_eq!(request["method"], "session/load");
-            Reply::Result(json!({"_meta": {"querymt/sessionLoadSnapshot.v1": {
-                "delegationUpdates": [update],
-                "audit": {"events": [{"kind": {"type": "tool_call_end", "data": {
-                    "tool_call_id": "dispatch-1", "tool_name": "delegate", "is_error": false, "result": "dispatched",
-                }}}]},
-            }}}))
-        }).await;
-        let output = invoke(
-            cli().args(["--url", &server.url, "--quiet", "inspect", "parent"]),
-            None,
-        )
-        .await;
-        assert!(output.status.success(), "{output:?}");
-        let result = events(&output).pop().unwrap();
-        assert_eq!(result["tools"][0]["id"], "dispatch-1");
-        assert_eq!(result["tools"][0]["status"], "ok");
-        let updates = result["delegations"]
-            .as_array()
-            .expect("compact delegation snapshot");
-        assert_eq!(updates.len(), 1);
-        assert_delegation_event(&updates[0], &expected);
-        server.finish().await;
+        let expected = enriched_remote_load(&update);
+        for full in [false, true] {
+            let response = expected.clone();
+            let server = MockServer::start(move |request| {
+                assert_eq!(request["method"], "session/load");
+                Reply::Result(response.clone())
+            })
+            .await;
+            let mut command = cli();
+            command.args(["--url", &server.url, "--quiet", "inspect", "parent"]);
+            if full {
+                command.arg("--full");
+            }
+            let output = invoke(&mut command, None).await;
+            assert!(output.status.success(), "{output:?}");
+            let result_events = events(&output);
+            assert_eq!(
+                result_events.len(),
+                1,
+                "snapshot only, no live notifications"
+            );
+            let result = &result_events[0];
+            if full {
+                assert_eq!(result["raw"], expected);
+            } else {
+                assert_eq!(result["tools"][0]["id"], "dispatch-1");
+                assert_eq!(result["tools"][0]["status"], "ok");
+                let updates = result["delegations"]
+                    .as_array()
+                    .expect("compact delegation snapshot");
+                assert_eq!(updates.len(), 1);
+                assert_delegation_event(&updates[0], &update);
+            }
+            assert_eq!(server.finish().await.len(), 2, "no catchup runtime query");
+        }
     }
 }
 
